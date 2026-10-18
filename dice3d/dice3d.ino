@@ -16,6 +16,20 @@
 #include <SensorQMI8658.hpp>
 #include <TouchDrvCSTXXX.hpp>
 #include "HWCDC.h"
+#include "dice_sdf.h"
+
+// ---------------------------------------------------------------- 渲染器选择
+//   0 = 旧的 6 平面扫描线（省 CPU，画质一般）
+//   1 = SDF 光线步进（画质好，吃 CPU）
+// 可用 -DDICE_USE_SDF=1 覆盖
+#ifndef DICE_USE_SDF
+#define DICE_USE_SDF 1
+#endif
+
+// SDF 内部渲染分辨率（1:1 直推，不放大）
+#ifndef SDF_RES
+#define SDF_RES 240
+#endif
 
 // ------------------------------------------------------------------ 引脚
 #define LCD_SDIO0 4
@@ -56,7 +70,7 @@
 //    缓冲写满后 Serial.printf 卡住 → 整个 UI 冻结（实测 fps 从 30 掉到 0.5）。
 //    所以运行时日志默认关闭，只在需要时打开，并且一律走下面的 SAFE_LOG
 //    （先看 availableForWrite，写不下就丢，绝不阻塞）。
-#define DICE_DEBUG_LOG 0
+#define DICE_DEBUG_LOG 1
 // 诊断用：开机 2 秒后自动翻滚一次，并逐帧打日志
 #define DICE_SELFTEST 0
 
@@ -213,6 +227,14 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 static uint16_t *lowBuf = nullptr;  // LOW_W*LOW_H RGB565
 static uint16_t *outBuf = nullptr;  // SCR_W*SCR_H RGB565
 
+#if DICE_USE_SDF
+// SDF 渲染器：1:1 直接渲染到 SDF_RES×SDF_RES，再 2× 放大推屏
+static dice::Renderer sdfR;
+static uint16_t *sdfBuf = nullptr;              // SDF_RES² RGB565
+static int sdfW = SDF_RES, sdfH = SDF_RES;
+static uint32_t sdfFrameMs = 0;                 // 实测每帧耗时
+#endif
+
 static int prevX0 = 0, prevY0 = 0, prevX1 = SCR_W - 1, prevY1 = SCR_H - 1;
 static bool firstFrame = true;
 
@@ -343,6 +365,50 @@ struct Proj { float x, y, z; bool ok; };
 static void renderDice(Quat q, float yOff) {
   // 1) 清空低分辨率缓冲
   memset(lowBuf, 0, (size_t)LOW_W * LOW_H * 2);
+
+#if DICE_USE_SDF
+  sdfBuf = (uint16_t *)heap_caps_malloc((size_t)sdfW * sdfH * 2, MALLOC_CAP_SPIRAM);
+  if (!sdfBuf) {
+    USBSerial.println("sdfBuf alloc failed");
+    while (true) delay(1000);
+  }
+  sdfR.buf = sdfBuf;
+  sdfR.W = sdfW;
+  sdfR.H = sdfH;
+  sdfR.p.focal = 1100.0f;
+  sdfR.p.camZ  = 4.2f;
+  USBSerial.printf("sdf %dx%d ready\n", sdfW, sdfH);
+
+  // ---- 开机基准：一次烧录就能拿到「分辨率 → 帧耗时」表（t1 验收要求）
+  {
+    static const int RES[] = {240, 200, 180, 160, 140, 120};
+    USBSerial.println("=== SDF BENCH ===");
+    USBSerial.println("res,ms,steps,sdf,hit");
+    for (uint8_t i = 0; i < sizeof(RES)/sizeof(RES[0]); i++) {
+      int r = RES[i];
+      uint16_t *tmp = (uint16_t *)heap_caps_malloc((size_t)r * r * 2, MALLOC_CAP_SPIRAM);
+      if (!tmp) { USBSerial.printf("%d,alloc_fail\n", r); continue; }
+
+      dice::Renderer bench;
+      bench.W = r; bench.H = r; bench.buf = tmp;
+      bench.p.focal = 1100.0f;
+      bench.p.camZ  = 4.2f;
+
+      dice::Quat bq = dice::targetForValue(3, 0.0f);
+      bench.render(bq, 0.0f);                 // 预热
+
+      const int N = 5;
+      uint32_t t0 = micros();
+      for (int k = 0; k < N; k++) bench.render(bq, 0.0f);
+      uint32_t ms = (micros() - t0) / 1000 / N;
+
+      USBSerial.printf("%d,%u,%u,%u,%u\n", r, ms,
+                       bench.statSteps, bench.statSdf, bench.statHits);
+      free(tmp);
+    }
+    USBSerial.println("=== BENCH END ===");
+  }
+#endif
 
   // 2) 顶点变换 + 投影
   V3 verts[8];
@@ -515,7 +581,68 @@ static void blitRect(int lx0, int ly0, int lx1, int ly1) {
   prevX0 = sx0; prevY0 = sy0; prevX1 = sx1; prevY1 = sy1;
 }
 
+#if DICE_USE_SDF
+// SDF 路径：渲染到 sdfBuf，再整块 2× 放大推屏（CO5300 要求偶数对齐）
+static void drawFrameSDF() {
+  uint32_t t0 = micros();
+
+  // 四元数：固件用 Quat，SDF 核心也用 Quat（同名同结构，直接传）
+  dice::Quat q;
+  q.w = qCur.w; q.x = qCur.x; q.y = qCur.y; q.z = qCur.z;
+
+  sdfR.buf = sdfBuf;
+  sdfR.W = sdfW;
+  sdfR.H = sdfH;
+  sdfR.render(q, hopY);
+
+  sdfFrameMs = (micros() - t0) / 1000;
+
+  // ★ 只推骰子的包围盒，不是整屏 —— 整屏 480² 在 QSPI 40MHz 下要 23ms，
+  //   而骰子只占约 75% 边长（面积 ~56%），能省掉近一半推屏时间。
+  // CO5300 要求起始坐标/宽/高全为偶数，所以往下取偶。
+  int lx0 = sdfR.bboxX0, ly0 = sdfR.bboxY0;
+  int lx1 = sdfR.bboxX1, ly1 = sdfR.bboxY1;
+  if (lx0 < 0) lx0 = 0;
+  if (ly0 < 0) ly0 = 0;
+  if (lx1 > sdfW - 1) lx1 = sdfW - 1;
+  if (ly1 > sdfH - 1) ly1 = sdfH - 1;
+  if (lx0 > lx1 || ly0 > ly1) return;
+
+  int sx0 = lx0 * 2, sy0 = ly0 * 2;
+  int sx1 = (lx1 + 1) * 2 - 1, sy1 = (ly1 + 1) * 2 - 1;
+  if (sx0 & 1) sx0--;
+  if (sy0 & 1) sy0--;
+  if (!(sx1 & 1)) sx1++;
+  if (!(sy1 & 1)) sy1++;
+  if (sx0 < 0) sx0 = 0;
+  if (sy0 < 0) sy0 = 0;
+  if (sx1 > SCR_W - 1) sx1 = SCR_W - 1;
+  if (sy1 > SCR_H - 1) sy1 = SCR_H - 1;
+
+  int w = sx1 - sx0 + 1, h = sy1 - sy0 + 1;
+  if (w <= 0 || h <= 0) return;
+
+  // 2× 放大到 outBuf（只放大这块）
+  for (int y = 0; y < h; y += 2) {
+    int ly = (sy0 + y) >> 1;
+    const uint16_t *src = sdfBuf + (size_t)ly * sdfW;
+    uint16_t *d0 = outBuf + (size_t)y * w;
+    uint16_t *d1 = d0 + w;
+    for (int x = 0; x < w; x += 2) {
+      uint16_t c = src[(sx0 + x) >> 1];
+      d0[x] = c; d0[x+1] = c;
+      d1[x] = c; d1[x+1] = c;
+    }
+  }
+  gfx->draw16bitRGBBitmap(sx0, sy0, outBuf, w, h);
+}
+#endif
+
 static void drawFrame() {
+#if DICE_USE_SDF
+  drawFrameSDF();
+  return;
+#endif
   int bx0, by0, bx1, by1;
   diceBBox(qCur, hopY, &bx0, &by0, &bx1, &by1);
 
@@ -788,7 +915,11 @@ void loop() {
 
   fpsFrames++;
   if (now - fpsLastMs >= 2000) {
+#if DICE_USE_SDF
+    SAFE_LOG("[fps] %.1f  sdf=%ums\n", fpsFrames * 1000.0f / (now - fpsLastMs), sdfFrameMs);
+#else
     SAFE_LOG("[fps] %.1f\n", fpsFrames * 1000.0f / (now - fpsLastMs));
+#endif
     fpsFrames = 0;
     fpsLastMs = now;
   }
