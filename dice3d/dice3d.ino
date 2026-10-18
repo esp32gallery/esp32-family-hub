@@ -235,6 +235,11 @@ static int sdfW = SDF_RES, sdfH = SDF_RES;
 static uint32_t sdfFrameMs = 0;                 // 实测每帧耗时
 #endif
 
+// 画面是否需要重绘：静止时跳过整个渲染，省 CPU/电、也不拖慢输入响应
+static bool frameDirty = true;
+#if DICE_USE_SDF
+#endif
+
 static int prevX0 = 0, prevY0 = 0, prevX1 = SCR_W - 1, prevY1 = SCR_H - 1;
 static bool firstFrame = true;
 
@@ -639,6 +644,9 @@ static void drawFrameSDF() {
 #endif
 
 static void drawFrame() {
+  if (!frameDirty) return;      // 画面没变，不重绘
+  frameDirty = false;
+
 #if DICE_USE_SDF
   drawFrameSDF();
   return;
@@ -692,6 +700,7 @@ static void startRoll() {
   qSpinStart = qCur;
   qSlerpFrom = qCur;
   mode = MODE_ROLLING;
+  frameDirty = true;
   rollStartMs = millis();
   lastInputMs = millis();
   lastRollMs = millis();
@@ -718,6 +727,7 @@ static void updateAnimation(uint32_t now) {
     lastMs = now;
     if (dt > 0.05f) dt = 0.05f;
     qCur = qnorm(qmul(qCur, qaxis(spinAxis, spinSpeed * dt)));
+    frameDirty = true;
 
     // 抛起
     float t = (float)el / (float)SPIN_MS;
@@ -730,9 +740,11 @@ static void updateAnimation(uint32_t now) {
     float e = 1.0f - powf(1.0f - t, 3.0f);
     qCur = qslerp(qSlerpFrom, qTarget, e);
     hopY = 0.0f;
+    frameDirty = true;
   } else {
     qCur = qTarget;
     hopY = 0.0f;
+    frameDirty = true;
     mode = MODE_IDLE;
     SAFE_LOG("[dice] landed %d\n", lastValue);
   }

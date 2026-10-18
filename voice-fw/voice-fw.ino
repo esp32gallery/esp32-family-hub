@@ -20,9 +20,9 @@
 #include "es7210.h"
 
 // ---------------------------------------------------------------- 配置
-#define WIFI_SSID     "你的WiFi名"
-#define WIFI_PASS     "你的WiFi密码"
-#define INBOX_BASE    "http://192.168.31.184:8896"
+#define WIFI_SSID     "ASUS"
+#define WIFI_PASS     "123qweasd"
+#define INBOX_BASE    "http://192.168.31.184:8896"   // Mac 的局域网 IP
 #define INBOX_SECRET  ""              // 与 VOICE_INBOX_SECRET 一致；不用就留空
 
 #define RECORD_MS     8000            // 最长录音
