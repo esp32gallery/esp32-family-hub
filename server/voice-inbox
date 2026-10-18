@@ -1,0 +1,808 @@
+#!/usr/bin/env node
+/**
+ * 语音信箱 · 内网网页版 + 手机推送
+ *
+ * 板子：选联系人 → 按住录音 → 松手发送
+ * 手机：点推送通知直接打开那条语音；也可以开 http://<ip>:8896 看全部
+ *
+ * 推送通道（可插拔，配置在 ~/.config/voice-inbox/contacts.json）：
+ *   bark    —— iOS，App Store 免费，5 分钟搞定（推荐）
+ *   ntfy    —— 跨平台，也要装 app
+ *   webhook —— 自己接（POST JSON）
+ *
+ * ⚠️ 内网 HTTP 网页**不能**用 Web Push（iOS 强制 HTTPS+SW），所以推送必须走上面这些外部通道。
+ */
+import http from "node:http";
+import crypto from "node:crypto";
+import https from "node:https";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+
+// ---------------------------------------------------------------- 配置
+const PORT = Number(process.env.VOICE_INBOX_PORT || 8896);
+const HOST = process.env.VOICE_INBOX_HOST || "0.0.0.0";
+const DIR = process.env.VOICE_INBOX_DIR || path.join(os.homedir(), "Desktop/voice-inbox");
+const CONF = process.env.VOICE_INBOX_CONF || path.join(os.homedir(), ".config/voice-inbox/contacts.json");
+const MAX_BYTES = Number(process.env.VOICE_INBOX_MAX_MB || 16) * 1024 * 1024;
+const SECRET = process.env.VOICE_INBOX_SECRET || "";
+const PUBLIC_PORT = Number(process.env.VOICE_PUBLIC_PORT || 8898);
+const PUBLIC_KEY_PATH = path.join(DIR, ".public-access-key");
+const LOCAL_TLS_DIR = path.join(os.homedir(), ".config/voice-inbox/tls");
+const LOCAL_HTTPS_PORT = Number(process.env.VOICE_LOCAL_HTTPS_PORT || 9443);
+const TG_CHAT_ID = process.env.VOICE_TG_CHAT_ID || "795477335";
+const TG_SEND_TOKEN_FILE = path.join(os.homedir(), ".config/voice-inbox/telegram-send-token");
+const TG_SECRETS = path.join(os.homedir(), ".secrets.env");
+// 网页和推送里用的地址；没配就自动取本机 IP
+const FORCE_BASE = process.env.VOICE_INBOX_BASE || "";
+const FFMPEG = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].find((p) => fs.existsSync(p)) || "ffmpeg";
+
+function telegramToken() {
+  try {
+    if (fs.existsSync(TG_SEND_TOKEN_FILE)) {
+      const own = fs.readFileSync(TG_SEND_TOKEN_FILE, "utf8").trim();
+      if (own) return own;
+    }
+    const m = fs.readFileSync(TG_SECRETS, "utf8").match(/^TG_BOT_TOKEN=(.+)$/m);
+    return m ? m[1].trim() : "";
+  } catch { return ""; }
+}
+
+async function telegramVoice(wavPath, caption) {
+  const token = telegramToken();
+  if (!token) { log("Telegram 发送跳过：没有 TG_BOT_TOKEN"); return false; }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "family-tg-"));
+  const ogg = path.join(tmp, "voice.ogg");
+  try {
+    await execFileP(FFMPEG, ["-nostdin", "-hide_banner", "-loglevel", "error",
+      "-i", wavPath, "-c:a", "libopus", "-b:a", "32k", "-ac", "1", "-ar", "48000",
+      "-f", "ogg", ogg], { timeout: 30000 });
+    const args = ["-sS", "--noproxy", "*", "-m", "60", "-X", "POST",
+      `https://api.telegram.org/bot${token}/sendVoice`,
+      "-F", `chat_id=${TG_CHAT_ID}`, "-F", `voice=@${ogg}`,
+      "-F", `caption=${caption.slice(0, 1024)}`];
+    try {
+      await execFileP("curl", args, { encoding: "utf8", timeout: 65000 });
+    } catch {
+      const retry = args.filter(x => x !== "--noproxy" && x !== "*");
+      retry.splice(1, 0, "-x", "socks5h://127.0.0.1:1082");
+      await execFileP("curl", retry, { encoding: "utf8", timeout: 65000 });
+    }
+    log(`Telegram 已发送语音 ${path.basename(wavPath)} → ${TG_CHAT_ID}`);
+    return true;
+  } catch (e) {
+    log(`Telegram 语音发送失败：${e.message}`);
+    return false;
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+fs.mkdirSync(DIR, { recursive: true });
+if (!fs.existsSync(PUBLIC_KEY_PATH)) fs.writeFileSync(PUBLIC_KEY_PATH, crypto.randomBytes(24).toString("hex"), { mode: 0o600 });
+const PUBLIC_KEY = fs.readFileSync(PUBLIC_KEY_PATH, "utf8").trim();
+const PUBLIC_URL = `https://apples-macbook-air.tail175e7c.ts.net/voice/?k=${PUBLIC_KEY}`;
+const INDEX_PATH = path.join(DIR, "index.json");
+
+function log(...a) {
+  console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
+}
+
+// ---------------------------------------------------------------- 联系人配置
+function loadConf() {
+  try {
+    return JSON.parse(fs.readFileSync(CONF, "utf8"));
+  } catch {
+    return { contacts: {}, baseUrl: "" };
+  }
+}
+function lanIp() {
+  const all = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const i of list || []) {
+      if (!i || i.family !== "IPv4" || i.internal) continue;
+      all.push({ name, address: i.address });
+    }
+  }
+  // 优先真实局域网（192.168/10./172.16-31），排除 Tailscale(100.64/10)、
+  // Clash fake-ip(198.18/15) 这些隧道地址 —— 否则会给出手机上打不开的 IP
+  const isTunnel = (a) =>
+    a.startsWith("100.") || a.startsWith("198.18.") || a.startsWith("198.19.") || a.startsWith("169.254.");
+  const lan = all.filter((x) => !isTunnel(x.address));
+  const pick = lan.find((x) => x.name.startsWith("en")) || lan[0] || all[0];
+  return pick ? pick.address : "127.0.0.1";
+}
+function baseUrl() {
+  const c = loadConf();
+  return FORCE_BASE || c.baseUrl || `http://${lanIp()}:${PORT}`;
+}
+
+// ---------------------------------------------------------------- 索引
+function loadIndex() {
+  try { return JSON.parse(fs.readFileSync(INDEX_PATH, "utf8")); } catch { return []; }
+}
+function saveIndex(list) {
+  fs.writeFileSync(INDEX_PATH, JSON.stringify(list, null, 1));
+}
+
+// ---------------------------------------------------------------- WAV 解析
+function parseWav(buf) {
+  if (buf.length < 44) return { ok: false, reason: "不足 44 字节" };
+  if (buf.toString("ascii", 0, 4) !== "RIFF") return { ok: false, reason: "不是 RIFF" };
+  if (buf.toString("ascii", 8, 12) !== "WAVE") return { ok: false, reason: "不是 WAVE" };
+  let p = 12, fmt = null, data = null;
+  while (p + 8 <= buf.length) {
+    const id = buf.toString("ascii", p, p + 4);
+    const sz = buf.readUInt32LE(p + 4);
+    const body = p + 8;
+    if (id === "fmt " && body + 16 <= buf.length) {
+      fmt = {
+        audioFormat: buf.readUInt16LE(body),
+        channels: buf.readUInt16LE(body + 2),
+        sampleRate: buf.readUInt32LE(body + 4),
+        bits: buf.readUInt16LE(body + 14),
+      };
+    } else if (id === "data") {
+      data = { len: Math.min(sz, buf.length - body) };
+    }
+    p = body + sz + (sz & 1);
+  }
+  if (!fmt) return { ok: false, reason: "没有 fmt" };
+  if (!data) return { ok: false, reason: "没有 data" };
+  if (fmt.audioFormat !== 1) return { ok: false, reason: `不是 PCM(${fmt.audioFormat})` };
+  if (data.len < 800) return { ok: false, reason: `太短(${data.len}B)` };
+  const bps = fmt.sampleRate * fmt.channels * (fmt.bits / 8);
+  return {
+    ok: true, sampleRate: fmt.sampleRate, channels: fmt.channels, bits: fmt.bits,
+    seconds: data.len / bps, dataLen: data.len,
+  };
+}
+
+// ffmpeg may add LIST/metadata chunks. The board streams the canonical 44-byte
+// PCM layout, so repack converted uploads to that exact layout.
+function canonicalWav(buf, sampleRate = 32000) {
+  let p = 12, data = null;
+  while (p + 8 <= buf.length) {
+    const size = buf.readUInt32LE(p + 4);
+    if (buf.toString("ascii", p, p + 4) === "data") {
+      data = buf.subarray(p + 8, Math.min(p + 8 + size, buf.length)); break;
+    }
+    p += 8 + size + (size & 1);
+  }
+  if (!data || !data.length) throw new Error("missing PCM data");
+  const head = Buffer.alloc(44);
+  head.write("RIFF", 0); head.writeUInt32LE(data.length + 36, 4);
+  head.write("WAVEfmt ", 8); head.writeUInt32LE(16, 16);
+  head.writeUInt16LE(1, 20); head.writeUInt16LE(1, 22);
+  head.writeUInt32LE(sampleRate, 24); head.writeUInt32LE(sampleRate * 2, 28);
+  head.writeUInt16LE(2, 32); head.writeUInt16LE(16, 34);
+  head.write("data", 36); head.writeUInt32LE(data.length, 40);
+  return Buffer.concat([head, data]);
+}
+
+// ---------------------------------------------------------------- 推送
+/** 发推送。失败只记日志，绝不影响「语音已保存」这件事。 */
+async function pushNotify(contactKey, meta, id) {
+  const c = loadConf();
+  const who = c.contacts?.[contactKey];
+  if (!who) { log(`推送跳过：没有联系人 ${contactKey}`); return { ok: false, why: "no contact" }; }
+  const p = who.push || {};
+  const link = `${baseUrl()}/#${id}`;
+  const title = `${who.name} 给你留了语音`;
+  const body = `${meta.seconds.toFixed(1)} 秒 · 点开收听`;
+
+  try {
+    if (p.type === "bark") {
+      // Bark: GET <base>/<title>/<body>?url=...&group=...
+      const base = p.url.replace(/\/+$/, "");
+      const u = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(body)}`
+        + `?url=${encodeURIComponent(link)}&group=voice&level=timeSensitive`;
+      const r = await fetch(u, { signal: AbortSignal.timeout(10000) });
+      const j = await r.json().catch(() => ({}));
+      log(`推送 bark ${who.name}: ${r.status} ${j.code ?? ""}`);
+      return { ok: r.ok && j.code === 200, status: r.status };
+    }
+
+    if (p.type === "ntfy") {
+      // ntfy: POST <server>/<topic>
+      const u = `${p.server || "https://ntfy.sh"}/${p.topic}`;
+      const r = await fetch(u, {
+        method: "POST",
+        headers: { Title: title, Click: link, Tags: "speech_balloon", Priority: "high" },
+        body: body,
+        signal: AbortSignal.timeout(10000),
+      });
+      log(`推送 ntfy ${who.name}: ${r.status}`);
+      return { ok: r.ok, status: r.status };
+    }
+
+    if (p.type === "webhook") {
+      const r = await fetch(p.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title, body, link, contact: contactKey, id, seconds: meta.seconds }),
+        signal: AbortSignal.timeout(10000),
+      });
+      log(`推送 webhook ${who.name}: ${r.status}`);
+      return { ok: r.ok, status: r.status };
+    }
+
+    log(`推送跳过：未知通道 ${p.type}`);
+    return { ok: false, why: "unknown type" };
+  } catch (e) {
+    log(`推送失败（${who.name}）：${e.message}`);
+    return { ok: false, why: e.message };
+  }
+}
+
+// ---------------------------------------------------------------- 网页
+const PAGE = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#f6f3ed">
+<title>语音信箱</title>
+<style>
+  :root { color-scheme: light; --bg:#f6f3ed; --card:#fffefa; --line:#d7d2c7; --fg:#24302a; --dim:#59675e; --accent:#176b56; --ok:#13804e; --warn:#a85a12; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; padding:16px 14px calc(104px + env(safe-area-inset-bottom));
+    background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;
+    max-width:640px; margin-inline:auto; }
+  header { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px; }
+  h1 { font-size:19px; margin:0; letter-spacing:.02em; }
+  .sub { font-size:12px; color:var(--dim); }
+  .tabs { display:flex; gap:8px; margin:12px 0 14px; overflow-x:auto; padding-bottom:2px; }
+  .tab { flex:0 0 auto; padding:6px 13px; border-radius:999px; border:1px solid var(--line);
+    background:var(--card); color:var(--dim); font-size:13px; cursor:pointer; }
+  .tab.on { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .item { background:var(--card); border:1px solid var(--line); border-radius:18px;
+    padding:12px 14px; margin-bottom:12px; display:flex; align-items:center; gap:12px;
+    width:fit-content; max-width:88%; min-width:min(280px,88%); }
+  .item.in { margin-right:auto; background:#fff1e4; border-color:#e5c3a8; }
+  .item.out { margin-left:auto; background:#e5f4e9; border-color:#b9d9c2; }
+  .item:active { filter:brightness(.96); }
+  .item.hl { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .play { width:52px; height:52px; flex:0 0 52px; border-radius:50%;
+    background:var(--accent); border:none; color:#fff; font-size:16px;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; }
+  .play.playing { background:var(--ok); }
+  .meta { flex:1; min-width:0; }
+  .from { font-size:11px; color:var(--accent); font-weight:600; margin-bottom:2px; }
+  .time { font-size:14px; font-weight:600; }
+  .info { font-size:11.5px; color:var(--dim); margin-top:3px; }
+  .bar { height:3px; background:#c4d0c6; border-radius:2px; margin-top:7px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0; background:var(--accent); transition:width .1s linear; }
+  .del { background:none; border:none; color:#59675e; font-size:18px; padding:8px; cursor:pointer; }
+  .empty { text-align:center; color:var(--dim); padding:60px 20px; font-size:13.5px; line-height:1.9; }
+  .dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--ok); margin-right:6px; vertical-align:1px; }
+  .dot.off { background:#9ba59c; }
+  .send { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 12px;
+    margin:12px 0; border:1px solid var(--line); background:var(--card); border-radius:14px; }
+  .send select,.send button { background:#fff; color:var(--fg); border:1px solid var(--line);
+    border-radius:9px; padding:9px; font-size:13px; }
+  .send input { min-width:0; flex:1; font-size:12px; }
+  .send small { flex:1; color:var(--dim); font-size:12px; }
+  .record { position:fixed; right:max(18px, calc((100vw - 640px)/2 + 18px));
+    bottom:calc(18px + env(safe-area-inset-bottom)); z-index:10;
+    width:80px; height:80px; border-radius:50%; border:0; background:#176b56;
+    color:#fff; font-size:30px; box-shadow:0 8px 24px #24302a55;
+    touch-action:none; user-select:none; -webkit-user-select:none; cursor:pointer; }
+  .record.active { background:#ef4444; transform:scale(1.08); }
+  .send details { width:100%; color:var(--dim); font-size:12px; }
+  .send details[open] { padding-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>语音信箱</h1>
+  <div class="sub"><span class="dot" id="dot"></span><span id="stat">连接中…</span></div>
+</header>
+<div class="send">
+  <select id="sender" aria-label="发送人"><option value="dad">👨 爸爸</option><option value="mom">👩 妈妈</option></select>
+  <small id="recordstat">按住右下角说话，松开发送</small>
+  <details><summary>发送已有录音</summary>
+    <input id="voicefile" type="file" accept="audio/*" capture="user" aria-label="选择录音文件">
+    <button id="upload" type="button">发送文件</button>
+    <small id="uploadstat">选择或用手机录音 App 录一段。</small>
+  </details>
+</div>
+<div class="tabs" id="tabs"></div>
+<div id="list"></div>
+<button id="record" class="record" type="button" aria-label="按住说话，松开发送">🎙️</button>
+
+<script>
+let items = [], contacts = {}, filter = null, playing = null;
+const BASE = location.pathname.startsWith('/voice/') ? '/voice' : '';
+
+function fmtTime(ts) {
+  const d = new Date(ts), now = new Date();
+  const hm = d.toTimeString().slice(0,5);
+  if (d.toDateString() === now.toDateString()) return '今天 ' + hm;
+  return (d.getMonth()+1) + '月' + d.getDate() + '日 ' + hm;
+}
+function fmtSize(b) { return b > 1048576 ? (b/1048576).toFixed(1)+'MB' : Math.round(b/1024)+'KB'; }
+
+function renderTabs() {
+  const el = document.getElementById('tabs');
+  const keys = Object.keys(contacts);
+  el.innerHTML = ['<div class="tab' + (filter===null?' on':'') + '" data-f="">全部</div>']
+    .concat(keys.map(k => '<div class="tab' + (filter===k?' on':'') + '" data-f="'+k+'">' + contacts[k] + '</div>'))
+    .join('');
+}
+
+function render() {
+  const el = document.getElementById('list');
+  const list = filter ? items.filter(it => it.contact === filter) : items;
+  if (!list.length) {
+    el.innerHTML = '<div class="empty">还没有语音<br>在板子上选联系人、按住屏幕说话</div>';
+    return;
+  }
+  el.innerHTML = list.map(it => \`
+    <div class="item \${it.direction === 'in' ? 'in' : 'out'}" id="i-\${it.id}">
+      <button class="play" data-play="\${it.id}">▶</button>
+      <div class="meta">
+        <div class="from">\${it.direction === 'in' ? (contacts[it.contact] || it.contact || '家人') : '宝宝'}</div>
+        <div class="time">\${fmtTime(it.ts)}</div>
+        <div class="info">\${it.seconds.toFixed(1)}s · \${it.sampleRate}Hz · \${fmtSize(it.bytes)}</div>
+        <div class="bar"><i id="bar-\${it.id}"></i></div>
+      </div>
+      <button class="del" data-del="\${it.id}">✕</button>
+    </div>\`).join('');
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(BASE + '/api/list', { cache:'no-store' });
+    const j = await r.json();
+    items = j.items; contacts = j.contacts || {};
+    document.getElementById('dot').className = 'dot';
+    document.getElementById('stat').textContent = items.length + ' 条';
+    renderTabs(); render();
+    items.slice(0, 3).forEach(it => warmAudio(it.id));
+  } catch (e) {
+    document.getElementById('dot').className = 'dot off';
+    document.getElementById('stat').textContent = '离线';
+  }
+}
+
+let audio = new Audio();
+audio.preload = 'auto';
+audio.playsInline = true;
+const audioCache = new Map();
+function warmAudio(id) {
+  if (!id || audioCache.has(id)) return;
+  const el = new Audio(BASE + '/audio/' + id);
+  el.preload = 'auto'; el.playsInline = true;
+  el.load(); audioCache.set(id, el);
+  while (audioCache.size > 8) audioCache.delete(audioCache.keys().next().value);
+}
+audio.addEventListener('ended', stopPlay);
+audio.addEventListener('playing', () => {
+  if (!playing) return;
+  const b = document.querySelector('[data-play="'+playing+'"]');
+  if (b) b.textContent='❚❚';
+});
+audio.addEventListener('timeupdate', () => {
+  if (!playing) return;
+  const bar = document.getElementById('bar-' + playing);
+  if (bar && audio.duration) bar.style.width = (audio.currentTime/audio.duration*100) + '%';
+});
+function stopPlay() {
+  if (playing) {
+    const b = document.querySelector('[data-play="'+playing+'"]');
+    if (b) { b.textContent='▶'; b.classList.remove('playing'); }
+    const bar = document.getElementById('bar-'+playing);
+    if (bar) bar.style.width='0';
+  }
+  playing = null;
+}
+
+document.addEventListener('click', async (e) => {
+  const f = e.target.dataset.f;
+  if (f !== undefined) { filter = f || null; renderTabs(); render(); return; }
+
+  const playId = e.target.dataset.play;
+  if (playId) {
+    if (playing === playId) { audio.pause(); stopPlay(); return; }
+    stopPlay(); playing = playId;
+    const btn = document.querySelector('[data-play="'+playId+'"]');
+    btn.textContent='…'; btn.classList.add('playing');
+    audio.src = BASE + '/audio/' + playId;
+    audio.play().catch(() => {
+      stopPlay();
+      document.getElementById('stat').textContent = '请再点一次播放';
+    });
+    return;
+  }
+
+  const delId = e.target.dataset.del;
+  if (delId) {
+    if (!confirm('删除这条语音？')) return;
+    await fetch(BASE + '/api/delete', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({id:delId}) });
+    if (playing === delId) { audio.pause(); stopPlay(); }
+    refresh();
+  }
+});
+
+document.getElementById('upload').addEventListener('click', async () => {
+  const file = document.getElementById('voicefile').files[0];
+  const stat = document.getElementById('uploadstat');
+  if (!file) { stat.textContent = '请先选择录音文件'; return; }
+  if (file.size > 16 * 1024 * 1024) { stat.textContent = '录音不能超过 16 MB'; return; }
+  const sender = document.getElementById('sender').value;
+  stat.textContent = '正在发送…';
+  try {
+    const res = await fetch(BASE + '/voice?from=' + encodeURIComponent(sender), {
+      method:'POST', headers:{'content-type':file.type || 'application/octet-stream'}, body:file
+    });
+    if (!res.ok) throw new Error(await res.text());
+    stat.textContent = '发送成功，板子会自动刷新';
+    document.getElementById('voicefile').value = '';
+    refresh();
+  } catch (err) { stat.textContent = '发送失败：' + err.message; }
+});
+
+let recorder = null, mic = null, chunks = [], recordClock = null;
+let pressHeld = false, sendingVoice = false, recordStarted = 0, recordSender = 'dad';
+const recordButton = document.getElementById('record');
+const recordStatus = document.getElementById('recordstat');
+const secureVoiceUrl = location.hostname === '192.168.31.114' ? 'https://192.168.31.114:9443/' : '__PUBLIC_URL__';
+if (!window.isSecureContext) {
+  recordStatus.textContent = '点右下角麦克风，打开手机语音入口';
+}
+recordButton.addEventListener('contextmenu', e => e.preventDefault());
+recordButton.addEventListener('click', () => {
+  if (!window.isSecureContext) location.assign(secureVoiceUrl);
+});
+recordButton.addEventListener('pointerdown', async e => {
+  e.preventDefault();
+  if (sendingVoice || pressHeld || (recorder && recorder.state === 'recording')) return;
+  if (!window.isSecureContext) {
+    recordStatus.textContent = '正在打开手机语音入口…';
+    location.assign(secureVoiceUrl);
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+    recordStatus.textContent = '当前浏览器不支持录音，请用手机 Safari 或 Chrome 打开';
+    return;
+  }
+  pressHeld = true;
+  recordButton.setPointerCapture(e.pointerId);
+  recordButton.classList.add('active');
+  recordButton.textContent = '🔴';
+  recordStatus.textContent = '请允许使用麦克风，并继续按住';
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!pressHeld) {
+      mic.getTracks().forEach(t => t.stop()); mic = null;
+      recordButton.classList.remove('active'); recordButton.textContent = '🎙️';
+      recordStatus.textContent = '麦克风已就绪，请再按住说话';
+      return;
+    }
+    chunks = [];
+    recordSender = document.getElementById('sender').value;
+    recorder = new MediaRecorder(mic);
+    recorder.addEventListener('dataavailable', e => { if (e.data.size) chunks.push(e.data); });
+    recorder.addEventListener('stop', async () => {
+      clearInterval(recordClock);
+      mic.getTracks().forEach(t => t.stop()); mic = null;
+      recordButton.textContent = '🎙️'; recordButton.classList.remove('active');
+      const clip = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      if (Date.now() - recordStarted < 400 || !clip.size) {
+        recordStatus.textContent = '说话时间太短，请按住再试'; return;
+      }
+      sendingVoice = true; recordStatus.textContent = '正在发送给板子…';
+      try {
+        const res = await fetch(BASE + '/voice?from=' + encodeURIComponent(recordSender), {
+          method:'POST', headers:{'content-type':clip.type || 'application/octet-stream'}, body:clip
+        });
+        if (!res.ok) throw new Error(await res.text());
+        recordStatus.textContent = '已发送到板子'; refresh();
+      } catch (err) { recordStatus.textContent = '发送失败：' + err.message; }
+      sendingVoice = false;
+    });
+    recorder.start(); recordStarted = Date.now();
+    recordButton.textContent = '🔴'; recordButton.classList.add('active');
+    recordStatus.textContent = '正在说话 0 秒';
+    recordClock = setInterval(() => {
+      const sec = Math.floor((Date.now() - recordStarted) / 1000);
+      recordStatus.textContent = '正在说话 ' + sec + ' 秒';
+      if (sec >= 60 && recorder.state === 'recording') recorder.stop();
+    }, 300);
+  } catch (err) {
+    if (mic) mic.getTracks().forEach(t => t.stop());
+    mic = null; pressHeld = false;
+    recordButton.classList.remove('active'); recordButton.textContent = '🎙️';
+    recordStatus.textContent = '麦克风无法使用：' + err.message;
+  }
+});
+function releaseVoice(e) {
+  if (e) e.preventDefault();
+  pressHeld = false;
+  if (recorder && recorder.state === 'recording') recorder.stop();
+}
+recordButton.addEventListener('pointerup', releaseVoice);
+recordButton.addEventListener('pointercancel', releaseVoice);
+
+// 从推送点进来会带 #<id>，自动定位并播放
+function jumpToHash() {
+  const id = location.hash.slice(1);
+  if (!id) return;
+  const el = document.getElementById('i-' + id);
+  if (!el) return;
+  el.classList.add('hl');
+  el.scrollIntoView({ block:'center' });
+  const btn = el.querySelector('[data-play]');
+  if (btn) btn.click();
+}
+
+refresh().then(() => setTimeout(jumpToHash, 300));
+window.addEventListener('hashchange', jumpToHash);
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>`;
+
+const MANIFEST = {
+  name: "语音信箱", short_name: "语音", start_url: "/", display: "standalone",
+  background_color: "#f6f3ed", theme_color: "#f6f3ed",
+  icons: [{
+    src: "data:image/svg+xml," + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"><rect width="512" height="512" rx="110" fill="#f6f3ed"/><circle cx="256" cy="256" r="150" fill="#176b56"/><path d="M256 150a52 52 0 0 1 52 52v54a52 52 0 0 1-104 0v-54a52 52 0 0 1 52-52zm-90 106a90 90 0 0 0 180 0M256 346v56" stroke="#fff" stroke-width="18" fill="none" stroke-linecap="round"/></svg>'),
+    sizes: "512x512", type: "image/svg+xml", purpose: "any",
+  }],
+};
+
+// ---------------------------------------------------------------- HTTP
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://x");
+
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(PAGE.replace('__PUBLIC_URL__', PUBLIC_URL)); return;
+  }
+  if (req.method === "GET" && url.pathname === "/local-ca.p12") {
+    const fp = path.join(LOCAL_TLS_DIR, "family-hub-local-ca.p12");
+    if (!fs.existsSync(fp)) { res.writeHead(404); res.end("not found"); return; }
+    res.writeHead(200, {
+      "content-type": "application/x-pkcs12",
+      "content-disposition": "attachment; filename=family-hub-local-ca.p12",
+      "cache-control": "no-store",
+    });
+    fs.createReadStream(fp).pipe(res); return;
+  }
+  if (req.method === "GET" && url.pathname === "/manifest.webmanifest") {
+    res.writeHead(200, { "content-type": "application/manifest+json" });
+    res.end(JSON.stringify(MANIFEST)); return;
+  }
+  // ---- 部署辅助：让另一台 Mac 能直接拉源码和配置
+  if (req.method === "GET" && url.pathname === "/deploy-air.sh") {
+    const fp = path.join(os.homedir(), "bin/voice-inbox-deploy.sh");
+    if (!fs.existsSync(fp)) { res.writeHead(404); res.end("no deploy script"); return; }
+    res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8" });
+    res.end(fs.readFileSync(fp)); return;
+  }
+  if (req.method === "GET" && url.pathname === "/_src/voice-inbox") {
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    res.end(fs.readFileSync(process.argv[1] || __filename)); return;
+  }
+  if (req.method === "GET" && url.pathname === "/_src/contacts.json") {
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(fs.readFileSync(CONF)); return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/healthz") {
+    const c = loadConf();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true, count: loadIndex().length, dir: DIR,
+      contacts: Object.fromEntries(Object.entries(c.contacts || {}).map(([k, v]) => [k, v.name])),
+      baseUrl: baseUrl(),
+    })); return;
+  }
+
+  // ---- 列表（带联系人名字，供网页做分栏）
+  if (req.method === "GET" && url.pathname === "/api/list") {
+    const c = loadConf();
+    const names = {};
+    for (const [k, v] of Object.entries(c.contacts || {})) names[k] = v.name || k;
+    res.writeHead(200, { "content-type": "application/json" });
+    const contact = url.searchParams.get("contact");
+    const direction = url.searchParams.get("direction");
+    const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 100));
+    res.end(JSON.stringify({
+      ok: true,
+      contacts: names,
+      items: loadIndex().filter((it) => (!contact || it.contact === contact) && (!direction || it.direction === direction))
+        .sort((a, b) => b.ts - a.ts).slice(0, limit),
+    })); return;
+  }
+
+  // ---- 播放（支持 Range，可拖动）
+  if (req.method === "GET" && url.pathname.startsWith("/audio/")) {
+    const id = path.basename(url.pathname.slice(7));
+    const fp = path.join(DIR, id + ".wav");
+    if (!fp.startsWith(DIR) || !fs.existsSync(fp)) { res.writeHead(404); res.end("not found"); return; }
+    const st = fs.statSync(fp);
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const start = m[1] ? parseInt(m[1]) : 0;
+      const end = m[2] ? parseInt(m[2]) : st.size - 1;
+      res.writeHead(206, {
+      "content-type": "audio/wav", "accept-ranges": "bytes",
+      "cache-control": "public, max-age=31536000, immutable",
+        "content-range": `bytes ${start}-${end}/${st.size}`,
+        "content-length": end - start + 1,
+      });
+      fs.createReadStream(fp, { start, end }).pipe(res);
+    } else {
+      res.writeHead(200, { "content-type": "audio/wav", "accept-ranges": "bytes",
+        "content-length": st.size, "cache-control": "public, max-age=31536000, immutable" });
+      fs.createReadStream(fp).pipe(res);
+    }
+    return;
+  }
+
+  // ---- 删除
+  if (req.method === "POST" && url.pathname === "/api/delete") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const { id } = JSON.parse(body || "{}");
+        saveIndex(loadIndex().filter((x) => x.id !== id));
+        const fp = path.join(DIR, path.basename(id) + ".wav");
+        if (fp.startsWith(DIR) && fs.existsSync(fp)) fs.unlinkSync(fp);
+        log(`删除 ${id}`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) { res.writeHead(400); res.end(String(e.message)); }
+    });
+    return;
+  }
+
+  // ---- 板子上传
+  if (req.method === "POST" && url.pathname === "/voice") {
+    if (SECRET) {
+      const got = req.headers["x-voice-secret"] || url.searchParams.get("k");
+      if (got !== SECRET) { res.writeHead(401); res.end("bad secret"); return; }
+    }
+    // 联系人从 query 或 header 来；板子最省事的做法是 query
+    const incoming = url.searchParams.has("from");
+    const contact = (url.searchParams.get(incoming ? "from" : "to") || req.headers["x-contact"] || "me").toString();
+    if (!/^(dad|mom|me)$/.test(contact)) { res.writeHead(400); res.end("unknown contact"); return; }
+
+    const chunks = [];
+    let total = 0, aborted = false;
+    req.on("data", (c) => {
+      total += c.length;
+      if (total > MAX_BYTES) {
+        aborted = true; res.writeHead(413); res.end("too large"); req.destroy(); return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", async () => {
+      if (aborted) return;
+      let body = Buffer.concat(chunks);
+      if (incoming) {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "voice-inbox-"));
+        try {
+          const input = path.join(tmp, "input");
+          const output = path.join(tmp, "output.wav");
+          fs.writeFileSync(input, body);
+          await execFileP(FFMPEG, ["-nostdin", "-hide_banner", "-loglevel", "error", "-i", input,
+            "-af", "highpass=f=150,equalizer=f=3200:t=q:w=1:g=2", "-ac", "1", "-ar", "32000",
+            "-c:a", "pcm_s16le", "-f", "wav", output],
+            { timeout: 30000 });
+          body = canonicalWav(fs.readFileSync(output));
+        } catch (e) {
+          res.writeHead(400); res.end("audio conversion failed"); return;
+        } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+      }
+      const info = parseWav(body);
+      if (!info.ok) {
+        log(`拒收 WAV：${info.reason}（${body.length}B）`);
+        res.writeHead(400); res.end(`bad wav: ${info.reason}`); return;
+      }
+
+      const ts = Date.now();
+      const id = `voice-${new Date(ts).toISOString().replace(/[:.]/g, "-")}`;
+      fs.writeFileSync(path.join(DIR, id + ".wav"), body);
+
+      const list = loadIndex();
+      list.push({
+        id, ts, contact, direction: incoming ? "in" : "out",
+        seconds: Number(info.seconds.toFixed(2)),
+        sampleRate: info.sampleRate, channels: info.channels, bits: info.bits,
+        bytes: body.length,
+      });
+      saveIndex(list);
+
+      log(`收到 ${info.seconds.toFixed(1)}s → ${contact} · ${info.sampleRate}Hz/${info.channels}ch · ${Math.round(body.length/1024)}KB`);
+
+      // 推送失败不影响「已保存」
+      const pr = incoming ? { ok: false } : await pushNotify(contact, info, id);
+      const tgsent = await telegramVoice(path.join(DIR, id + ".wav"),
+        `宝宝发给${loadConf().contacts?.[contact]?.name || contact} · ${info.seconds.toFixed(1)} 秒`);
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, id, seconds: info.seconds, pushed: pr.ok, tg: tgsent }));
+    });
+    return;
+  }
+
+  res.writeHead(404, { "content-type": "text/plain" });
+  res.end("404\n");
+});
+
+server.listen(PORT, HOST, () => {
+  const c = loadConf();
+  log("语音信箱已启动");
+  log(`  手机打开： ${baseUrl()}/`);
+  log(`  板子上传： POST ${baseUrl()}/voice?to=<联系人key>`);
+  log(`  存储目录： ${DIR}`);
+  log(`  联系人： ${Object.entries(c.contacts || {}).map(([k, v]) => `${k}=${v.name}`).join('  ') || '（未配置）'}`);
+  log(`  已有 ${loadIndex().length} 条`);
+});
+
+// Funnel 暴露的独立入口：分享链接换取仅限 /voice/ 的会话 Cookie。
+// 内网服务及板子 API 不经过这里；公开入口只代理网页必需的路由。
+http.createServer((req, res) => {
+  const url = new URL(req.url, "http://x");
+  let route = url.pathname.startsWith("/voice/") ? url.pathname.slice(6) : url.pathname;
+  if (route === "/voice") route = "/voice";
+  const key = url.searchParams.get("k") || "";
+  const valid = (s) => s.length === PUBLIC_KEY.length &&
+    crypto.timingSafeEqual(Buffer.from(s), Buffer.from(PUBLIC_KEY));
+  if (key && valid(key) && req.method === "GET" && (route === "/" || route === "/index.html")) {
+    res.writeHead(302, { "set-cookie": `voice_access=${PUBLIC_KEY}; Path=/voice/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax`, "location": "/voice/" });
+    res.end(); return;
+  }
+  const cookie = (req.headers.cookie || "").split(";").map(s => s.trim()).find(s => s.startsWith("voice_access="));
+  if (!cookie || !valid(cookie.slice(13))) {
+    res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
+    res.end("请使用家人分享的语音链接打开"); return;
+  }
+  const allowed = (req.method === "GET" && (route === "/" || route === "/index.html" || route === "/api/list" || route.startsWith("/audio/"))) ||
+    (req.method === "POST" && (route === "/voice" || route === "/api/delete"));
+  if (!allowed) { res.writeHead(404); res.end(); return; }
+  const headers = { ...req.headers, host: `127.0.0.1:${PORT}` };
+  delete headers.cookie;
+  const proxy = http.request({ hostname: "127.0.0.1", port: PORT, method: req.method,
+    path: route + url.search, headers }, upstream => {
+    res.writeHead(upstream.statusCode || 502, upstream.headers);
+    upstream.pipe(res);
+  });
+  proxy.on("error", () => { if (!res.headersSent) res.writeHead(502); res.end("服务暂不可用"); });
+  req.pipe(proxy);
+}).listen(PUBLIC_PORT, "127.0.0.1", () => log(`受保护的手机入口就绪：127.0.0.1:${PUBLIC_PORT}`));
+
+// 内网直连：局域网 IP 不走 Tailscale。手机安装本站局域网根证书后，
+// 可直接在这里录音、收听并发送，路径和 HTTP 页面完全一致。
+try {
+  const cert = fs.readFileSync(path.join(LOCAL_TLS_DIR, "server.crt"));
+  const key = fs.readFileSync(path.join(LOCAL_TLS_DIR, "server.key"));
+  https.createServer({ cert, key }, (req, res) => {
+    const proxy = http.request({
+      hostname: "127.0.0.1", port: PORT, method: req.method,
+      path: req.url, headers: { ...req.headers, host: `127.0.0.1:${PORT}` }
+    }, upstream => {
+      res.writeHead(upstream.statusCode || 502, upstream.headers);
+      upstream.pipe(res);
+    });
+    proxy.on("error", () => { if (!res.headersSent) res.writeHead(502); res.end("服务暂不可用"); });
+    req.pipe(proxy);
+  }).listen(LOCAL_HTTPS_PORT, "0.0.0.0", () =>
+    log(`局域网 HTTPS：https://${lanIp()}:${LOCAL_HTTPS_PORT}/`));
+} catch (e) {
+  if (e.code !== "ENOENT") log(`局域网 HTTPS 未启动：${e.message}`);
+}

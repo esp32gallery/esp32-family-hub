@@ -10,6 +10,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>   // 连不上时开热点，手机网页配网（存 NVS，下次自动连）
 #include <HTTPClient.h>
 #include <driver/i2s.h>
 #include <Wire.h>
@@ -20,9 +21,11 @@
 #include "es7210.h"
 
 // ---------------------------------------------------------------- 配置
+// WiFi：优先用 NVS 里保存的（配网过就用那个）；没有则尝试这里的默认值；
+// 都连不上 → 开热点 "VoiceMemo-Setup"，手机连上去配网。
 #define WIFI_SSID     "ASUS"
 #define WIFI_PASS     "123qweasd"
-#define INBOX_BASE    "http://192.168.31.184:8896"   // Mac 的局域网 IP
+#define INBOX_BASE    "http://192.168.31.114:8896"   // Air 的局域网 IP
 #define INBOX_SECRET  ""              // 与 VOICE_INBOX_SECRET 一致；不用就留空
 
 #define RECORD_MS     8000            // 最长录音
@@ -78,6 +81,7 @@ enum State { ST_IDLE, ST_RECORDING, ST_SENDING, ST_DONE, ST_ERROR };
 static State state = ST_IDLE;
 static int   sel = 0;                 // 当前选中的联系人
 static char  status[64] = "";
+static char  gInboxBase[112] = INBOX_BASE;   // 可在配网页覆盖
 static uint32_t stateAt = 0;
 
 // 按钮几何（3 个横排）
@@ -224,10 +228,11 @@ static size_t recordLoop() {
   while (millis() - t0 < RECORD_MS && written + CH / 2 <= pcmCap) {
     // 每 ~100ms 检查一次是否松手
     static uint32_t lastChk = 0;
-    if (millis() - lastChk > 100) {
+    if (millis() - lastChk > 50) {
       lastChk = millis();
       if (!touchStillDown() && millis() - t0 > MIN_MS) break;
-      drawUI();                      // 更新进度条
+      static uint32_t lastDraw = 0;
+      if (millis() - lastDraw > 100) { lastDraw = millis(); drawUI(); }
     }
 
     size_t got = 0;
@@ -270,7 +275,7 @@ static bool upload(size_t samples) {
   const size_t total = 44 + dataBytes;
 
   char url[192];
-  snprintf(url, sizeof(url), "%s/voice?to=%s", INBOX_BASE, CONTACTS[sel].key);
+  snprintf(url, sizeof(url), "%s/voice?to=%s", gInboxBase, CONTACTS[sel].key);
 
   uint8_t *body = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
   if (!body) { USBSerial.println("[http] alloc fail"); return false; }
@@ -311,10 +316,15 @@ static bool readTouch(int16_t &x, int16_t &y) {
 
 // 录音期间用：只判断「还在按」——靠 TP_INT 是否持续触发不准，
 // 改为主动读触摸芯片当前状态
+// 按住期间 getPoint() 可能偶发返回 0（触摸芯片通常只在状态变化时更新坐标），
+// 单次读不到不能算松手 —— 要连续 MISS_TO_STOP 次才算。
 static bool touchStillDown() {
   if (!touchOk) return false;
+  static uint8_t miss = 0;
   uint8_t n = touch.getPoint(tx, ty, touch.getSupportTouchPoint());
-  return n > 0;
+  if (n > 0) { miss = 0; return true; }
+  if (++miss >= 5) { miss = 0; return false; }   // 约 500ms 连续读不到才停
+  return true;
 }
 
 static int hitButton(int16_t x, int16_t y) {
@@ -359,11 +369,39 @@ void setup() {
   if (!pcm) { USBSerial.println("pcm alloc fail"); while (1) delay(1000); }
   USBSerial.printf("pcm %u samples (%.1f s)\n", (unsigned)pcmCap, (float)pcmCap / SAMPLE_RATE);
 
+  // ---- WiFi：先试默认，不行就开热点配网
   setState(ST_IDLE, "wifi connecting...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(300);
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(300);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // 连不上 → 开热点让手机配网
+    USBSerial.println("[wifi] default failed, starting config portal");
+    setState(ST_ERROR, "wifi setup: join VoiceMemo-Setup");
+
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(180);          // 3 分钟没配好就放弃，避免一直卡着
+    wm.setAPCallback([](WiFiManager *) {
+      USBSerial.println("[wifi] AP: VoiceMemo-Setup  打开 192.168.4.1");
+    });
+    // 自定义参数：服务器地址也能在网页里改（换地方时不用重烧固件）
+    WiFiManagerParameter pSrv("srv", "服务器地址 (Mac/Air 的 IP:端口)",
+                              INBOX_BASE, 96);
+    wm.addParameter(&pSrv);
+
+    bool ok = wm.autoConnect("VoiceMemo-Setup");
+    if (ok) {
+      USBSerial.printf("[wifi] configured, ip=%s\n", WiFi.localIP().toString().c_str());
+      const char *srv = pSrv.getValue();
+      if (srv && strlen(srv) > 8) {
+        strncpy(gInboxBase, srv, sizeof(gInboxBase) - 1);
+        USBSerial.printf("[wifi] server overridden: %s\n", gInboxBase);
+      }
+    }
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     USBSerial.printf("wifi ok %s\n", WiFi.localIP().toString().c_str());
     setState(ST_IDLE, "ready");

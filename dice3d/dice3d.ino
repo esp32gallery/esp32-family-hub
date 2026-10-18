@@ -371,50 +371,6 @@ static void renderDice(Quat q, float yOff) {
   // 1) 清空低分辨率缓冲
   memset(lowBuf, 0, (size_t)LOW_W * LOW_H * 2);
 
-#if DICE_USE_SDF
-  sdfBuf = (uint16_t *)heap_caps_malloc((size_t)sdfW * sdfH * 2, MALLOC_CAP_SPIRAM);
-  if (!sdfBuf) {
-    USBSerial.println("sdfBuf alloc failed");
-    while (true) delay(1000);
-  }
-  sdfR.buf = sdfBuf;
-  sdfR.W = sdfW;
-  sdfR.H = sdfH;
-  sdfR.p.focal = 1100.0f;
-  sdfR.p.camZ  = 4.2f;
-  USBSerial.printf("sdf %dx%d ready\n", sdfW, sdfH);
-
-  // ---- 开机基准：一次烧录就能拿到「分辨率 → 帧耗时」表（t1 验收要求）
-  {
-    static const int RES[] = {240, 200, 180, 160, 140, 120};
-    USBSerial.println("=== SDF BENCH ===");
-    USBSerial.println("res,ms,steps,sdf,hit");
-    for (uint8_t i = 0; i < sizeof(RES)/sizeof(RES[0]); i++) {
-      int r = RES[i];
-      uint16_t *tmp = (uint16_t *)heap_caps_malloc((size_t)r * r * 2, MALLOC_CAP_SPIRAM);
-      if (!tmp) { USBSerial.printf("%d,alloc_fail\n", r); continue; }
-
-      dice::Renderer bench;
-      bench.W = r; bench.H = r; bench.buf = tmp;
-      bench.p.focal = 1100.0f;
-      bench.p.camZ  = 4.2f;
-
-      dice::Quat bq = dice::targetForValue(3, 0.0f);
-      bench.render(bq, 0.0f);                 // 预热
-
-      const int N = 5;
-      uint32_t t0 = micros();
-      for (int k = 0; k < N; k++) bench.render(bq, 0.0f);
-      uint32_t ms = (micros() - t0) / 1000 / N;
-
-      USBSerial.printf("%d,%u,%u,%u,%u\n", r, ms,
-                       bench.statSteps, bench.statSdf, bench.statHits);
-      free(tmp);
-    }
-    USBSerial.println("=== BENCH END ===");
-  }
-#endif
-
   // 2) 顶点变换 + 投影
   V3 verts[8];
   Proj proj[8];
@@ -823,6 +779,32 @@ static void updateBrightness(uint32_t now, bool input) {
   }
 }
 
+#if DICE_USE_SDF
+// Send 'b' through the USB monitor to run this on demand after the monitor opens.
+static void runSdfBench() {
+  static const int RES[] = {240, 200, 180, 160, 140, 120};
+  USBSerial.println("=== SDF BENCH ===");
+  USBSerial.println("res,ms,steps,sdf,hit");
+  for (int r : RES) {
+    uint16_t *tmp = (uint16_t *)heap_caps_malloc((size_t)r * r * 2, MALLOC_CAP_SPIRAM);
+    if (!tmp) { USBSerial.printf("%d,alloc_fail\n", r); continue; }
+    dice::Renderer bench;
+    bench.W = r; bench.H = r; bench.buf = tmp;
+    bench.p.focal = 1100.0f; bench.p.camZ = 4.2f;
+    dice::Quat bq = dice::targetForValue(3, 0.0f);
+    bench.render(bq, 0.0f);
+    const int N = 5;
+    uint32_t t0 = micros();
+    for (int k = 0; k < N; k++) bench.render(bq, 0.0f);
+    uint32_t ms = (micros() - t0) / 1000 / N;
+    USBSerial.printf("%d,%u,%u,%u,%u\n", r, ms,
+                     bench.statSteps, bench.statSdf, bench.statHits);
+    free(tmp);
+  }
+  USBSerial.println("=== BENCH END ===");
+}
+#endif
+
 // ------------------------------------------------------------------ setup
 void setup() {
   USBSerial.begin(115200);
@@ -879,6 +861,13 @@ void setup() {
   }
   memset(lowBuf, 0, (size_t)LOW_W * LOW_H * 2);
 
+#if DICE_USE_SDF
+  sdfBuf = (uint16_t *)heap_caps_malloc((size_t)sdfW * sdfH * 2, MALLOC_CAP_SPIRAM);
+  if (!sdfBuf) { USBSerial.println("SDF buffer allocation failed"); while (true) delay(1000); }
+  sdfR.buf = sdfBuf; sdfR.W = sdfW; sdfR.H = sdfH;
+  sdfR.p.focal = 1100.0f; sdfR.p.camZ = 4.2f;
+#endif
+
 
 
   // 初始姿态：1 点朝前
@@ -893,6 +882,9 @@ void setup() {
 // ------------------------------------------------------------------ loop
 void loop() {
   uint32_t now = millis();
+#if DICE_USE_SDF
+  if (USBSerial.available() && USBSerial.read() == 'b') runSdfBench();
+#endif
   bool input = false;
 
 #if DICE_SELFTEST
