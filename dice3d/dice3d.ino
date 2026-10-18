@@ -56,9 +56,9 @@
 //    缓冲写满后 Serial.printf 卡住 → 整个 UI 冻结（实测 fps 从 30 掉到 0.5）。
 //    所以运行时日志默认关闭，只在需要时打开，并且一律走下面的 SAFE_LOG
 //    （先看 availableForWrite，写不下就丢，绝不阻塞）。
-#define DICE_DEBUG_LOG 1
+#define DICE_DEBUG_LOG 0
 // 诊断用：开机 2 秒后自动翻滚一次，并逐帧打日志
-#define DICE_SELFTEST 1
+#define DICE_SELFTEST 0
 
 // 用宏而不是函数：函数会成为「文件里第一个函数」，Arduino 自动生成的
 // 函数原型会被插到 struct V3 之前 → 编译报 'V3' does not name a type。
