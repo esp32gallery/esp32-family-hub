@@ -61,7 +61,7 @@ async function telegramVoice(wavPath, caption) {
     await execFileP(FFMPEG, ["-nostdin", "-hide_banner", "-loglevel", "error",
       "-i", wavPath, "-c:a", "libopus", "-b:a", "32k", "-ac", "1", "-ar", "48000",
       "-f", "ogg", ogg], { timeout: 30000 });
-    const args = ["-sS", "--noproxy", "*", "-m", "60", "-X", "POST",
+    const args = ["-sS", "--noproxy", "*", "-m", "20", "-X", "POST",
       `https://api.telegram.org/bot${token}/sendVoice`,
       "-F", `chat_id=${TG_CHAT_ID}`, "-F", `voice=@${ogg}`,
       "-F", `caption=${caption.slice(0, 1024)}`];
@@ -69,8 +69,8 @@ async function telegramVoice(wavPath, caption) {
       await execFileP("curl", args, { encoding: "utf8", timeout: 65000 });
     } catch {
       const retry = args.filter(x => x !== "--noproxy" && x !== "*");
-      retry.splice(1, 0, "-x", "socks5h://127.0.0.1:1082");
-      await execFileP("curl", retry, { encoding: "utf8", timeout: 65000 });
+      retry.splice(1, 0, "-x", "http://127.0.0.1:7890");
+      await execFileP("curl", retry, { encoding: "utf8", timeout: 25000 });
     }
     log(`Telegram 已发送语音 ${path.basename(wavPath)} → ${TG_CHAT_ID}`);
     return true;
@@ -731,11 +731,14 @@ const server = http.createServer(async (req, res) => {
 
       // 推送失败不影响「已保存」
       const pr = incoming ? { ok: false } : await pushNotify(contact, info, id);
-      const tgsent = await telegramVoice(path.join(DIR, id + ".wav"),
-        `宝宝发给${loadConf().contacts?.[contact]?.name || contact} · ${info.seconds.toFixed(1)} 秒`);
+      // Telegram is a secondary copy. Never make the device wait for an
+      // external network service after the WAV has already been saved.
+      const tgWav = path.join(DIR, id + ".wav");
+      const tgCaption = `宝宝发给${loadConf().contacts?.[contact]?.name || contact} · ${info.seconds.toFixed(1)} 秒`;
+      telegramVoice(tgWav, tgCaption).catch(e => log(`Telegram 后台失败：${e.message}`));
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, id, seconds: info.seconds, pushed: pr.ok, tg: tgsent }));
+      res.end(JSON.stringify({ ok: true, id, seconds: info.seconds, pushed: pr.ok, tg: "queued" }));
     });
     return;
   }

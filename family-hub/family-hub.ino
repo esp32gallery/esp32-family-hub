@@ -607,9 +607,14 @@ static bool uploadAudio(size_t count) {
   WiFiClient client; HTTPClient http;
   bool ok = false;
   if (http.begin(client, url)) {
-    http.setTimeout(30000); http.addHeader("Content-Type", "audio/wav");
+    http.setConnectTimeout(4000);
+    http.setTimeout(12000); http.addHeader("Content-Type", "audio/wav");
     if (*INBOX_SECRET) http.addHeader("X-Voice-Secret", INBOX_SECRET);
-    ok = http.POST(body, total) == 200;
+    int status = http.POST(body, total);
+    ok = status == 200;
+    char report[64]; snprintf(report, sizeof(report), "[upload] status=%d bytes=%u\n",
+                              status, (unsigned)total);
+    safeLog(report);
     http.end();
   }
   free(body); return ok;
@@ -988,6 +993,7 @@ void loop() {
   if (screenLocked) {
     if (digitalRead(KEY_PIN) == LOW || digitalRead(BOOT_PIN) == LOW) {
       screenLocked = false;
+      bus->writeC8D8(0x53, 0x20);  // display on
       gfx->setBrightness(brightness);
       redraw();
       delay(250);
@@ -1021,7 +1027,7 @@ void loop() {
     if (page == PAGE_DICE) rollDice();
     else {
       screenLocked = true;
-      gfx->setBrightness(0);
+      bus->writeC8D8(0x53, 0x28);  // display off
       drawLocked();
     }
   }
