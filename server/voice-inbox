@@ -36,20 +36,17 @@ const LOCAL_TLS_DIR = path.join(os.homedir(), ".config/voice-inbox/tls");
 const LOCAL_HTTPS_PORT = Number(process.env.VOICE_LOCAL_HTTPS_PORT || 9443);
 const TG_CHAT_ID = process.env.VOICE_TG_CHAT_ID || "795477335";
 const TG_SEND_TOKEN_FILE = path.join(os.homedir(), ".config/voice-inbox/telegram-send-token");
-const TG_SECRETS = path.join(os.homedir(), ".secrets.env");
+
 // 网页和推送里用的地址；没配就自动取本机 IP
 const FORCE_BASE = process.env.VOICE_INBOX_BASE || "";
 const FFMPEG = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].find((p) => fs.existsSync(p)) || "ffmpeg";
 
 function telegramToken() {
-  try {
-    if (fs.existsSync(TG_SEND_TOKEN_FILE)) {
-      const own = fs.readFileSync(TG_SEND_TOKEN_FILE, "utf8").trim();
-      if (own) return own;
-    }
-    const m = fs.readFileSync(TG_SECRETS, "utf8").match(/^TG_BOT_TOKEN=(.+)$/m);
-    return m ? m[1].trim() : "";
-  } catch { return ""; }
+  try { return fs.readFileSync(TG_SEND_TOKEN_FILE, "utf8").trim(); }
+  catch { return ""; }
+}
+function safeTelegramError(e) {
+  return String(e.message || e).replace(/bot[0-9]+:[A-Za-z0-9_-]+/g, "bot[redacted]");
 }
 
 async function telegramVoice(wavPath, caption) {
@@ -61,21 +58,17 @@ async function telegramVoice(wavPath, caption) {
     await execFileP(FFMPEG, ["-nostdin", "-hide_banner", "-loglevel", "error",
       "-i", wavPath, "-c:a", "libopus", "-b:a", "32k", "-ac", "1", "-ar", "48000",
       "-f", "ogg", ogg], { timeout: 30000 });
-    const args = ["-sS", "--noproxy", "*", "-m", "20", "-X", "POST",
+    const args = ["-sS", "-x", "http://127.0.0.1:7890", "-m", "25", "-X", "POST",
       `https://api.telegram.org/bot${token}/sendVoice`,
       "-F", `chat_id=${TG_CHAT_ID}`, "-F", `voice=@${ogg}`,
       "-F", `caption=${caption.slice(0, 1024)}`];
-    try {
-      await execFileP("curl", args, { encoding: "utf8", timeout: 65000 });
-    } catch {
-      const retry = args.filter(x => x !== "--noproxy" && x !== "*");
-      retry.splice(1, 0, "-x", "http://127.0.0.1:7890");
-      await execFileP("curl", retry, { encoding: "utf8", timeout: 25000 });
-    }
+    const { stdout } = await execFileP("curl", args, { encoding: "utf8", timeout: 30000 });
+    const result = JSON.parse(stdout);
+    if (!result.ok) throw new Error(`Telegram ${result.error_code}: ${result.description}`);
     log(`Telegram 已发送语音 ${path.basename(wavPath)} → ${TG_CHAT_ID}`);
     return true;
   } catch (e) {
-    log(`Telegram 语音发送失败：${e.message}`);
+    log(`Telegram 语音发送失败：${safeTelegramError(e)}`);
     return false;
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -91,6 +84,31 @@ const INDEX_PATH = path.join(DIR, "index.json");
 function log(...a) {
   console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
 }
+
+const TG_QUEUE_PATH = path.join(DIR, ".telegram-queue.json");
+let tgQueue = [];
+try { tgQueue = JSON.parse(fs.readFileSync(TG_QUEUE_PATH, "utf8")); } catch {}
+let tgSending = false;
+function saveTelegramQueue() {
+  fs.writeFileSync(TG_QUEUE_PATH + ".tmp", JSON.stringify(tgQueue), { mode: 0o600 });
+  fs.renameSync(TG_QUEUE_PATH + ".tmp", TG_QUEUE_PATH);
+}
+function queueTelegram(id) {
+  if (!tgQueue.includes(id)) { tgQueue.push(id); saveTelegramQueue(); }
+  drainTelegramQueue().catch(e => log(safeTelegramError(e)));
+}
+async function drainTelegramQueue() {
+  if (tgSending || !tgQueue.length) return;
+  tgSending = true;
+  try {
+    while (tgQueue.length) {
+      const id = tgQueue[0], wav = path.join(DIR, id + ".wav");
+      if (fs.existsSync(wav) && !await telegramVoice(wav, "宝宝")) break;
+      tgQueue.shift(); saveTelegramQueue();
+    }
+  } finally { tgSending = false; }
+}
+setInterval(() => drainTelegramQueue().catch(e => log(safeTelegramError(e))), 15000).unref();
 
 // ---------------------------------------------------------------- 联系人配置
 function loadConf() {
@@ -126,7 +144,8 @@ function loadIndex() {
   try { return JSON.parse(fs.readFileSync(INDEX_PATH, "utf8")); } catch { return []; }
 }
 function saveIndex(list) {
-  fs.writeFileSync(INDEX_PATH, JSON.stringify(list, null, 1));
+  fs.writeFileSync(INDEX_PATH + ".tmp", JSON.stringify(list, null, 1));
+  fs.renameSync(INDEX_PATH + ".tmp", INDEX_PATH);
 }
 
 // ---------------------------------------------------------------- WAV 解析
@@ -308,19 +327,24 @@ const PAGE = `<!DOCTYPE html>
 <div class="send">
   <select id="sender" aria-label="发送人"><option value="dad">👨 爸爸</option><option value="mom">👩 妈妈</option></select>
   <small id="recordstat">按住右下角说话，松开发送</small>
+  <details id="lan-help" hidden><summary>首次使用</summary>
+    <p><a href="/local-ca.crt">下载内网证书</a> · <a href="https://192.168.31.114:9443/">内网通话</a></p>
+    <small>iPhone 安装后，在设置 → 通用 → 关于本机 → 证书信任设置中开启信任，再打开内网通话。</small>
+  </details>
   <details><summary>发送已有录音</summary>
     <input id="voicefile" type="file" accept="audio/*" capture="user" aria-label="选择录音文件">
     <button id="upload" type="button">发送文件</button>
     <small id="uploadstat">选择或用手机录音 App 录一段。</small>
   </details>
 </div>
-<div class="tabs" id="tabs"></div>
+
 <div id="list"></div>
 <button id="record" class="record" type="button" aria-label="按住说话，松开发送">🎙️</button>
 
 <script>
-let items = [], contacts = {}, filter = null, playing = null;
+let items = [], contacts = {}, playing = null;
 const BASE = location.pathname.startsWith('/voice/') ? '/voice' : '';
+document.getElementById('lan-help').hidden = location.hostname !== '192.168.31.114';
 
 function fmtTime(ts) {
   const d = new Date(ts), now = new Date();
@@ -330,31 +354,23 @@ function fmtTime(ts) {
 }
 function fmtSize(b) { return b > 1048576 ? (b/1048576).toFixed(1)+'MB' : Math.round(b/1024)+'KB'; }
 
-function renderTabs() {
-  const el = document.getElementById('tabs');
-  const keys = Object.keys(contacts);
-  el.innerHTML = ['<div class="tab' + (filter===null?' on':'') + '" data-f="">全部</div>']
-    .concat(keys.map(k => '<div class="tab' + (filter===k?' on':'') + '" data-f="'+k+'">' + contacts[k] + '</div>'))
-    .join('');
-}
-
 function render() {
   const el = document.getElementById('list');
-  const list = filter ? items.filter(it => it.contact === filter) : items;
+  const list = items;
   if (!list.length) {
-    el.innerHTML = '<div class="empty">还没有语音<br>在板子上选联系人、按住屏幕说话</div>';
+    el.innerHTML = '<div class="empty">还没有语音<br>按住麦克风，和家人说说话</div>';
     return;
   }
   el.innerHTML = list.map(it => \`
     <div class="item \${it.direction === 'in' ? 'in' : 'out'}" id="i-\${it.id}">
-      <button class="play" data-play="\${it.id}">▶</button>
+      <button class="play" aria-label="播放语音" data-play="\${it.id}">▶</button>
       <div class="meta">
         <div class="from">\${it.direction === 'in' ? (contacts[it.contact] || it.contact || '家人') : '宝宝'}</div>
         <div class="time">\${fmtTime(it.ts)}</div>
-        <div class="info">\${it.seconds.toFixed(1)}s · \${it.sampleRate}Hz · \${fmtSize(it.bytes)}</div>
+        <div class="info">\${it.seconds.toFixed(1)} 秒</div>
         <div class="bar"><i id="bar-\${it.id}"></i></div>
       </div>
-      <button class="del" data-del="\${it.id}">✕</button>
+      <button class="del" aria-label="删除语音" data-del="\${it.id}">✕</button>
     </div>\`).join('');
 }
 
@@ -365,7 +381,7 @@ async function refresh() {
     items = j.items; contacts = j.contacts || {};
     document.getElementById('dot').className = 'dot';
     document.getElementById('stat').textContent = items.length + ' 条';
-    renderTabs(); render();
+    render();
     items.slice(0, 3).forEach(it => warmAudio(it.id));
   } catch (e) {
     document.getElementById('dot').className = 'dot off';
@@ -384,17 +400,24 @@ function warmAudio(id) {
   el.load(); audioCache.set(id, el);
   while (audioCache.size > 8) audioCache.delete(audioCache.keys().next().value);
 }
-audio.addEventListener('ended', stopPlay);
-audio.addEventListener('playing', () => {
+const boundAudio = new WeakSet();
+function bindAudio(el) {
+  if (boundAudio.has(el)) return;
+  boundAudio.add(el);
+el.addEventListener('ended', stopPlay);
+el.addEventListener('playing', () => {
   if (!playing) return;
   const b = document.querySelector('[data-play="'+playing+'"]');
   if (b) b.textContent='❚❚';
 });
-audio.addEventListener('timeupdate', () => {
+el.addEventListener('timeupdate', () => {
   if (!playing) return;
   const bar = document.getElementById('bar-' + playing);
   if (bar && audio.duration) bar.style.width = (audio.currentTime/audio.duration*100) + '%';
 });
+  el.addEventListener('error', () => { if (el === audio) { stopPlay(); document.getElementById('stat').textContent='播放失败，请再试'; } });
+}
+bindAudio(audio);
 function stopPlay() {
   if (playing) {
     const b = document.querySelector('[data-play="'+playing+'"]');
@@ -406,16 +429,15 @@ function stopPlay() {
 }
 
 document.addEventListener('click', async (e) => {
-  const f = e.target.dataset.f;
-  if (f !== undefined) { filter = f || null; renderTabs(); render(); return; }
 
   const playId = e.target.dataset.play;
   if (playId) {
     if (playing === playId) { audio.pause(); stopPlay(); return; }
-    stopPlay(); playing = playId;
+    audio.pause(); stopPlay(); playing = playId;
     const btn = document.querySelector('[data-play="'+playId+'"]');
     btn.textContent='…'; btn.classList.add('playing');
-    audio.src = BASE + '/audio/' + playId;
+    warmAudio(playId); audio = audioCache.get(playId); bindAudio(audio);
+    audio.currentTime = 0;
     audio.play().catch(() => {
       stopPlay();
       document.getElementById('stat').textContent = '请再点一次播放';
@@ -505,7 +527,7 @@ recordButton.addEventListener('pointerdown', async e => {
           method:'POST', headers:{'content-type':clip.type || 'application/octet-stream'}, body:clip
         });
         if (!res.ok) throw new Error(await res.text());
-        recordStatus.textContent = '已发送到板子'; refresh();
+        recordStatus.textContent = '✓'; refresh();
       } catch (err) { recordStatus.textContent = '发送失败：' + err.message; }
       sendingVoice = false;
     });
@@ -531,6 +553,8 @@ function releaseVoice(e) {
 }
 recordButton.addEventListener('pointerup', releaseVoice);
 recordButton.addEventListener('pointercancel', releaseVoice);
+recordButton.addEventListener('lostpointercapture', releaseVoice);
+window.addEventListener('blur', releaseVoice);
 
 // 从推送点进来会带 #<id>，自动定位并播放
 function jumpToHash() {
@@ -569,12 +593,12 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(PAGE.replace('__PUBLIC_URL__', PUBLIC_URL)); return;
   }
-  if (req.method === "GET" && url.pathname === "/local-ca.p12") {
-    const fp = path.join(LOCAL_TLS_DIR, "family-hub-local-ca.p12");
+  if (req.method === "GET" && url.pathname === "/local-ca.crt") {
+    const fp = path.join(LOCAL_TLS_DIR, "ca.crt");
     if (!fs.existsSync(fp)) { res.writeHead(404); res.end("not found"); return; }
     res.writeHead(200, {
-      "content-type": "application/x-pkcs12",
-      "content-disposition": "attachment; filename=family-hub-local-ca.p12",
+      "content-type": "application/x-x509-ca-cert",
+      "content-disposition": "attachment; filename=family-hub-local-ca.crt",
       "cache-control": "no-store",
     });
     fs.createReadStream(fp).pipe(res); return;
@@ -634,9 +658,14 @@ const server = http.createServer(async (req, res) => {
     const st = fs.statSync(fp);
     const range = req.headers.range;
     if (range) {
-      const m = /bytes=(\d*)-(\d*)/.exec(range);
-      const start = m[1] ? parseInt(m[1]) : 0;
-      const end = m[2] ? parseInt(m[2]) : st.size - 1;
+      const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+      let start = m && m[1] ? Number(m[1]) : 0;
+      let end = m && m[2] ? Number(m[2]) : st.size - 1;
+      if (m && !m[1] && m[2]) { start = Math.max(0,st.size-Number(m[2])); end = st.size-1; }
+      end = Math.min(end, st.size-1);
+      if (!m || (!m[1] && !m[2]) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= st.size) {
+        res.writeHead(416, { "content-range": `bytes */${st.size}` }); res.end(); return;
+      }
       res.writeHead(206, {
       "content-type": "audio/wav", "accept-ranges": "bytes",
       "cache-control": "public, max-age=31536000, immutable",
@@ -700,7 +729,7 @@ const server = http.createServer(async (req, res) => {
           const output = path.join(tmp, "output.wav");
           fs.writeFileSync(input, body);
           await execFileP(FFMPEG, ["-nostdin", "-hide_banner", "-loglevel", "error", "-i", input,
-            "-af", "highpass=f=150,equalizer=f=3200:t=q:w=1:g=2", "-ac", "1", "-ar", "32000",
+            "-af", "highpass=f=80,equalizer=f=3200:t=q:w=1:g=1", "-ac", "1", "-ar", "32000",
             "-c:a", "pcm_s16le", "-f", "wav", output],
             { timeout: 30000 });
           body = canonicalWav(fs.readFileSync(output));
@@ -714,13 +743,18 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400); res.end(`bad wav: ${info.reason}`); return;
       }
 
+      const source = url.searchParams.get("source") || "";
+      if (source && source.length <= 100) {
+        const prior = loadIndex().find(it => it.source === source);
+        if (prior) { res.writeHead(200, {"content-type":"application/json"}); res.end(JSON.stringify({ok:true,id:prior.id})); return; }
+      }
       const ts = Date.now();
-      const id = `voice-${new Date(ts).toISOString().replace(/[:.]/g, "-")}`;
+      const id = `voice-${new Date(ts).toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
       fs.writeFileSync(path.join(DIR, id + ".wav"), body);
 
       const list = loadIndex();
       list.push({
-        id, ts, contact, direction: incoming ? "in" : "out",
+        id, ts, contact, direction: incoming ? "in" : "out", source: source.slice(0,100),
         seconds: Number(info.seconds.toFixed(2)),
         sampleRate: info.sampleRate, channels: info.channels, bits: info.bits,
         bytes: body.length,
@@ -729,16 +763,14 @@ const server = http.createServer(async (req, res) => {
 
       log(`收到 ${info.seconds.toFixed(1)}s → ${contact} · ${info.sampleRate}Hz/${info.channels}ch · ${Math.round(body.length/1024)}KB`);
 
-      // 推送失败不影响「已保存」
-      const pr = incoming ? { ok: false } : await pushNotify(contact, info, id);
-      // Telegram is a secondary copy. Never make the device wait for an
-      // external network service after the WAV has already been saved.
-      const tgWav = path.join(DIR, id + ".wav");
-      const tgCaption = `宝宝发给${loadConf().contacts?.[contact]?.name || contact} · ${info.seconds.toFixed(1)} 秒`;
-      telegramVoice(tgWav, tgCaption).catch(e => log(`Telegram 后台失败：${e.message}`));
-
+      // Acknowledge local storage immediately; external delivery is durable and retried.
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, id, seconds: info.seconds, pushed: pr.ok, tg: "queued" }));
+      res.end(JSON.stringify({ ok: true, id, seconds: info.seconds, tg: incoming ? "none" : "queued" }));
+      if (!incoming) {
+        queueTelegram(id);
+        pushNotify(contact, info, id).catch(e => log(`推送失败：${safeTelegramError(e)}`));
+      }
+
     });
     return;
   }
@@ -804,7 +836,7 @@ try {
     });
     proxy.on("error", () => { if (!res.headersSent) res.writeHead(502); res.end("服务暂不可用"); });
     req.pipe(proxy);
-  }).listen(LOCAL_HTTPS_PORT, "0.0.0.0", () =>
+  }).on("error", e => log(`局域网 HTTPS 错误：${e.code || "unknown"}`)).listen(LOCAL_HTTPS_PORT, "0.0.0.0", () =>
     log(`局域网 HTTPS：https://${lanIp()}:${LOCAL_HTTPS_PORT}/`));
 } catch (e) {
   if (e.code !== "ENOENT") log(`局域网 HTTPS 未启动：${e.message}`);

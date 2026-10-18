@@ -1,118 +1,12 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Family Hub · 骰子真机模拟器</title>
-<style>
-  :root { color-scheme: dark; --bg:#11130f; --panel:#1d211a; --line:#394034; --fg:#f3f1e8; --dim:#a4aa9c; --accent:#b5cf45; }
-  * { box-sizing:border-box; }
-  body { margin:0; min-height:100vh; background:radial-gradient(circle at 50% 25%, #25291f, var(--bg) 60%); color:var(--fg);
-    font-family:"Helvetica Neue", "PingFang SC", sans-serif; display:flex; flex-direction:column; align-items:center;
-    justify-content:center; gap:18px; padding:24px; }
-  .stage { width:480px; height:480px; border-radius:34px; overflow:hidden; background:#000;
-    box-shadow:0 0 0 8px #060706, 0 0 0 10px #525a49, 0 28px 80px #000a; }
-  canvas { display:block; width:480px; height:480px; }
-  .bar { width:480px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
-  button { border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:10px;
-    padding:10px 15px; font:inherit; cursor:pointer; }
-  button:hover { border-color:var(--accent); }
-  .stats { color:var(--dim); font:12px ui-monospace, Menlo, monospace; }
-  .note { width:480px; color:var(--dim); font-size:12px; line-height:1.65; }
-  @media(max-width:540px) { body { padding:12px; } .stage,.bar,.note { width:min(92vw,480px); height:auto; aspect-ratio:1; } .stage { height:auto; } canvas { width:100%; height:auto; } }
-</style>
-</head>
-<body>
-<div class="stage"><canvas id="cv" width="480" height="480"></canvas></div>
-<div class="bar"><button id="roll">点一下骰子</button><div class="stats" id="stats">等待点按</div></div>
-<div class="note">模拟真机流程：点按立即显示第 0 帧，640ms 内播放 12 帧真实 SDF 姿态，然后显示 480×480 静帧。使用与固件相同的相机、圆角盒、光照和结果姿态。页面显示的是姿态效果；ESP32 的真实屏幕推帧时间仍以串口日志为准。</div>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>家庭小站 · 固件画面预览</title>
+<style>body{font:17px system-ui;background:#fff4dc;color:#26332c;margin:24px auto;max-width:850px;padding:0 12px}canvas{width:min(100%,480px);height:auto;border-radius:32px;display:block;background:#000}button,select{font:inherit;padding:12px 18px;border-radius:16px;border:1px solid #b4bca8;background:white;margin:12px 6px 12px 0}#strip{display:flex;overflow:auto;gap:8px}#strip img{width:144px;border-radius:12px}p{line-height:1.6}img.font{width:480px;max-width:100%}</style>
+<h1>家庭小站 · 固件画面预览</h1><canvas width="480" height="480" id="screen"></canvas>
+<button id="roll">抛骰子</button><label>落点 <select id="target"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option></select></label><button id="step">逐帧</button>
+<p id="status">加载中</p><div id="strip"></div><p>姿态、RGB565 颜色、缩放、抛起位移均由固件共享的 C++ 代码生成。这里只预览画面和节奏，不能模拟触摸芯片、显示总线时序或扬声器听感。</p><h2>原生字体样张</h2><img class="font" src="font-native.png" alt="32和40像素简体中文Medium字重原生字形">
 <script>
-'use strict';
-const W=480, RES=160, FRAMES=12, ROLL_MS=640;
-const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
-const img=ctx.createImageData(W,W);
-let seq=[]; // 与固件同一目标的 12 帧 SDF 姿态
-const FOCAL=800, CAM_Z=4.2, H=0.5, R=0.088, BOX=H-R;
-const PIP_OFF=0.29, PIP_RAD=0.098, PIP_DEPTH=0.34;
-const TILT_X=-0.50, TILT_Y=0.55;
-const LIGHT=norm(v3(-0.38,0.70,-0.60));
-function v3(x,y,z){return{x,y,z}}
-function add(a,b){return v3(a.x+b.x,a.y+b.y,a.z+b.z)}
-function sub(a,b){return v3(a.x-b.x,a.y-b.y,a.z-b.z)}
-function mul(a,s){return v3(a.x*s,a.y*s,a.z*s)}
-function dot(a,b){return a.x*b.x+a.y*b.y+a.z*b.z}
-function cross(a,b){return v3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x)}
-function norm(a){const l=Math.sqrt(dot(a,a));return l>1e-9?mul(a,1/l):v3(0,0,0)}
-function qmul(a,b){return{w:a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z,x:a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
-y:a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,z:a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w}}
-function qnorm(q){const l=Math.sqrt(q.w*q.w+q.x*q.x+q.y*q.y+q.z*q.z);if(l<1e-9)return{w:1,x:0,y:0,z:0};
-const s=1/l;return{w:q.w*s,x:q.x*s,y:q.y*s,z:q.z*s}}
-function qaxis(a,x){a=norm(a);const h=x*.5,s=Math.sin(h);return{w:Math.cos(h),x:a.x*s,y:a.y*s,z:a.z*s}}
-function qconj(q){return{w:q.w,x:-q.x,y:-q.y,z:-q.z}}
-function qfromto(a,b){a=norm(a);b=norm(b);const d=dot(a,b);if(d>.99999)return{w:1,x:0,y:0,z:0};
-if(d<-.99999){let x=cross(a,v3(1,0,0));if(Math.sqrt(dot(x,x))<1e-4)x=cross(a,v3(0,1,0));x=norm(x);
-return{w:0,x:x.x,y:x.y,z:x.z}}const x=cross(a,b);return qnorm({w:1+d,x:x.x,y:x.y,z:x.z})}
-function qrot(v,q){const u=v3(q.x,q.y,q.z),t=mul(cross(u,v),2);return add(add(v,mul(t,q.w)),cross(u,t))}
-const FACES=[
-{n:v3(0,0,1),r:v3(1,0,0),u:v3(0,1,0),val:1},{n:v3(0,0,-1),r:v3(-1,0,0),u:v3(0,1,0),val:6},
-{n:v3(1,0,0),r:v3(0,0,-1),u:v3(0,1,0),val:4},{n:v3(-1,0,0),r:v3(0,0,1),u:v3(0,1,0),val:3},
-{n:v3(0,1,0),r:v3(1,0,0),u:v3(0,0,-1),val:2},{n:v3(0,-1,0),r:v3(1,0,0),u:v3(0,0,1),val:5}];
-const PIPS=[[],[[0,0]],[[-.29,-.29],[.29,.29]],[[-.29,-.29],[0,0],[.29,.29]],
-[[-.29,-.29],[.29,-.29],[-.29,.29],[.29,.29]],[[-.29,-.29],[.29,-.29],[0,0],[-.29,.29],[.29,.29]],
-[[-.29,-.29],[.29,-.29],[-.29,0],[.29,0],[-.29,.29],[.29,.29]]];
-const FACE_PIPS=FACES.map(a=>PIPS[a.val]);
-function targetForValue(v,angle){const face=FACES.find(f=>f.val===v);const align=qfromto(face.n,v3(0,1,0));
-const roll=qaxis(v3(0,1,0),angle);const tilt=qmul(qaxis(v3(1,0,0),TILT_X),qaxis(v3(0,1,0),TILT_Y));
-return qnorm(qmul(tilt,qmul(roll,align)))}
-function sdf(p){const qx=Math.abs(p.x)-BOX,qy=Math.abs(p.y)-BOX,qz=Math.abs(p.z)-BOX;
-const mx=Math.max(qx,0),my=Math.max(qy,0),mz=Math.max(qz,0);
-return Math.sqrt(mx*mx+my*my+mz*mz)+Math.min(Math.max(qx,Math.max(qy,qz)),0)-R}
-const TET=[[1,-1,-1],[-1,-1,1],[-1,1,-1],[1,1,1]];
-function sdfNormal(p){let n=v3(0,0,0),e=.0006;for(const a of TET)n=add(n,mul(v3(a[0],a[1],a[2]),sdf(v3(p.x+a[0]*e,p.y+a[1]*e,p.z+a[2]*e))));return norm(n)}
-function pipHit(ax,sign,pu,pv,val){const pts=PIPS[val];for(const p of pts){const da=pu-p[0],db=pv-p[1],d2=da*da+db*db;
-if(d2>=PIP_RAD*PIP_RAD)continue;const d=Math.sqrt(d2),t=d/PIP_RAD,s=Math.sqrt(Math.max(1e-6,1-t*t));
-const slope=PIP_DEPTH*t/Math.max(1e-3,s),ux=d>1e-9?da/d:0,uy=d>1e-9?db/d:0,nl=Math.sqrt(slope*slope+1);
-const radial=add(mul(ax.r,slope*ux/nl),mul(ax.u,slope*uy/nl));return{hit:true,n:norm(sub(mul(ax.n,sign)/nl,radial)),open:1/nl,edge:t}}return{hit:false}}
-function pack(r,g,b){r=Math.max(0,Math.min(255,r|0));g=Math.max(0,Math.min(255,g|0));b=Math.max(0,Math.min(255,b|0));
-return((255<<24)|(b<<16)|(g<<8)|r)>>>0}
-function render(q,yOff,Wd){const out=new Uint32Array(Wd*Wd),half=Wd*.5,focal=FOCAL*(Wd/480),bound=H*Math.sqrt(3);
-const qInv=qconj(q),org=qrot(v3(0,-yOff,-CAM_Z),qInv);
-for(let y=0;y<Wd;y++){const sy=half-(y+.5);for(let x=0;x<Wd;x++){const sx=(x+.5)-half;
-let dx=sx/focal,dy=sy/focal,dz=1,dl=Math.sqrt(dx*dx+dy*dy+1);dx/=dl;dy/=dl;dz/=dl;
-const dir=qrot(v3(dx,dy,dz),qInv),b=dot(org,dir),c=dot(org,org)-bound*bound,disc=b*b-c;
-if(disc<0)continue;const sq=Math.sqrt(disc);let t=Math.max(0,-b-sq),t1=-b+sq,hit=false;
-for(let s=0;s<56;s++){const p=add(org,mul(dir,t)),d=sdf(p);if(d<.0008){hit=true;break}t+=d*.92;if(t>t1)break}
-if(!hit)continue;const p=add(org,mul(dir,t)),n=sdfNormal(p),a=Math.abs(n.x),ay=Math.abs(n.y),az=Math.abs(n.z);
-let fi,sign;if(a>=ay&&a>=az){sign=n.x>=0?1:-1;fi=sign>0?2:3}else if(ay>=a&&ay>=az){sign=n.y>=0?1:-1;fi=sign>0?4:5}
-else{sign=n.z>=0?1:-1;fi=sign>0?0:1}const face=FACES[fi],pu=dot(p,face.r),pv=dot(p,face.u);
-const ph=pipHit(face,sign,pu,pv,face.val);let nf=n,ocolor=0,open=1,edge=1;
-if(ph.hit){nf=ph.n;open=ph.open;edge=ph.edge;const nw=qrot(nf,q),lam=Math.max(0,dot(nw,LIGHT));
-let k=.45+.32*open+.23*lam;k=Math.min(1,k);if(edge>.86)k*=.8;ocolor=pack(252*k,250*k,246*k)}
-else{const nw=qrot(nf,q);let occ=0,scale=1;for(let s=0;s<4;s++){const hd=.008+.055*s,p2=add(p,mul(nf,hd)),dd=sdf(p2);
-occ+=(hd-dd)*scale;scale*=.72}let ao=Math.max(0,Math.min(1,1-occ*7));ao=.3+.7*ao;
-const lam=Math.max(0,dot(nw,LIGHT)),hemi=.5+.5*nw.y;let k=.42+.22*hemi+.36*lam;k*=ao;k=Math.min(1.02,k);
-ocolor=pack(214*k,38*k,38*k)}out[y*Wd+x]=ocolor}}
-return out}
-let currentQ=targetForValue(1,.1),animating=false,result=1;
-function putFrame(src){const data=new Uint8ClampedArray(W*W*4);for(let i=0;i<W*W;i++){
-const c=src[i],ix=i*4;data[ix]=c&255;data[ix+1]=(c>>>8)&255;data[ix+2]=(c>>>16)&255;data[ix+3]=255}
-img.data.set(data);ctx.putImageData(img,0,0)}
-function build(v){const target=targetForValue(v,.1),frames=[];
-for(let f=0;f<FRAMES;f++){let e=f/FRAMES;e=1-Math.pow(1-e,3);
-const spin=qaxis(v3(.64,.78,.21),(1-e)*6.5);frames.push(render(qnorm(qmul(spin,target)),.22*Math.sin(f/FRAMES*Math.PI),RES))}
-return frames}
-async function roll(){if(animating)return;animating=true;result=1+Math.floor(Math.random()*6);
-document.getElementById('stats').textContent='准备姿态缓存';seq=build(result);
-document.getElementById('stats').textContent='第 0 帧 · 立即显示';putFrame(seq[0]);
-const started=performance.now(),target=targetForValue(result,.1);
-for(let f=1;f<FRAMES;f++){const due=started+f*ROLL_MS/FRAMES;await new Promise(r=>setTimeout(r,Math.max(0,due-performance.now())));
-document.getElementById('stats').textContent=`第 ${f} 帧 / ${FRAMES-1} · ${Math.round(performance.now()-started)}ms`;
-putFrame(seq[f])}
-currentQ=target;putFrame(render(currentQ,0,W));animating=false;
-document.getElementById('stats').textContent=`点数 ${result} · 总 ${Math.round(performance.now()-started)}ms`}
-document.getElementById('roll').onclick=roll;document.getElementById('cv').onclick=roll;
-document.getElementById('stats').textContent='正在生成静态面';
-setTimeout(()=>{putFrame(render(currentQ,0,W));document.getElementById('stats').textContent='点一下骰子'},20);
-</script>
-</body>
-</html>
+const cv=document.querySelector('canvas'),ctx=cv.getContext('2d'),status=document.querySelector('#status'),strip=document.querySelector('#strip');let value=1,seq=[],at=0,busy=false;
+async function prepare(){const to=+document.querySelector('#target').value;seq=await Promise.all(Array.from({length:13},(_,i)=>new Promise((resolve,reject)=>{const im=new Image;im.onload=()=>resolve(im);im.onerror=reject;im.src=`frames/${value}-${to}-${String(i).padStart(2,'0')}.png`})));strip.replaceChildren(...seq.map((im,i)=>{const thumb=im.cloneNode();thumb.title=`第${i}帧`;thumb.onclick=()=>show(i);return thumb}));at=0;show(0);return to}
+function show(i){at=i;ctx.drawImage(seq[i],0,0);status.textContent=`第 ${i}/12 帧`}
+document.querySelector('#roll').onclick=async()=>{if(busy)return;busy=true;try{const to=await prepare(),start=performance.now();for(let i=1;i<=12;i++){await new Promise(r=>setTimeout(r,Math.max(0,start+i*80-performance.now())));show(i)}value=to;status.textContent=`落点 ${to} · ${Math.round(performance.now()-start)} 毫秒`}finally{busy=false}};
+document.querySelector('#step').onclick=()=>{if(!busy)show((at+1)%13)};document.querySelector('#target').onchange=()=>prepare();prepare().catch(()=>status.textContent='先运行 README 中的预览生成命令');
+</script></html>

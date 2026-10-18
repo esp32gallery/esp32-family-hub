@@ -1,0 +1,13 @@
+[status] touch=1 imu=1 audio=1 codec=1 wifi=1 cache=1 psram=1209332 mac=44:BD:8D:78:9F:B4
+
+[dice] cached static=82 ms
+[dice] cached static=81 ms
+[dice] physical throw 10 frames 1122 ms result=5
+
+[dice] cached static=82 ms
+[dice] cached static=81 ms
+[dice] physical throw 10 frames 1120 ms result=6
+
+[dice] cached static=82 ms
+[dice] cached static=82 ms
+[dice] physical throw 10 frames 1122 ms result=5

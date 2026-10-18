@@ -10,7 +10,6 @@
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <Arduino_GFX_Library.h>
-#include <font/glcdfont.h>
 #include <TouchDrvCSTXXX.hpp>
 #include <SensorQMI8658.hpp>
 #include <HWCDC.h>
@@ -20,6 +19,7 @@ extern "C" {
 }
 #include "es7210.h"
 #include "dice_sdf.h"
+#include "roll_motion.h"
 #include "zh_font.h"
 
 #define WIFI_SSID "ASUS"
@@ -47,24 +47,24 @@ extern "C" {
 #define I2S_MCLK 42
 #define SCR_W 480
 #define SCR_H 480
-#define ROLL_MS 680
-#define ROLL_FRAMES 10
-#define ROLL_RES 160
+#define ROLL_MS 960
+#define ROLL_FRAMES rollmotion::COUNT
+#define ROLL_RES rollmotion::RES
 #define SAMPLE_RATE 16000
-#define MAX_REC_MS 8000
+#define MAX_REC_MS 15000
 #define MIN_REC_MS 400
 #define MAX_MESSAGES 3
 
-static const uint16_t C_BG = 0x0843, C_CARD = 0x18C6, C_LINE = 0x294A;
-static const uint16_t C_WHITE = 0xFFDF, C_MUTED = 0x9CF3;
-static const uint16_t C_TEAL = 0x35D5, C_PINK = 0xFB4F, C_GOLD = 0xFD27;
-static const uint16_t C_RED = 0xE2A8, C_OUT = 0x2B69;
+static const uint16_t C_BG = 0xFF9B, C_CARD = 0xFFFF, C_LINE = 0xD651;
+static const uint16_t C_WHITE = 0x2126, C_MUTED = 0x632C;
+static const uint16_t C_TEAL = 0x76B5, C_PINK = 0xFCB5, C_GOLD = 0xFE0C;
+static const uint16_t C_RED = 0xFC51, C_OUT = 0x2B69;
 
 struct Contact { const char *key; const char *name; uint16_t color; };
 static const Contact CONTACTS[] = {
   {"dad", "爸爸", C_GOLD}, {"mom", "妈妈", C_RED}, {"me", "我自己", C_TEAL}
 };
-struct Message { char id[48]; uint32_t ts; uint16_t seconds; bool incoming; };
+struct Message { char id[48]; uint32_t ts; uint16_t seconds; bool incoming; uint8_t sender; };
 enum Page { PAGE_HOME, PAGE_DICE, PAGE_VOICE, PAGE_SETTINGS };
 enum VoiceState { VOICE_READY, VOICE_RECORDING, VOICE_SENDING, VOICE_PLAYING, VOICE_ERROR };
 
@@ -88,8 +88,6 @@ static uint8_t brightness = 200, volume = 68;
 static int contact = 0, messageCount = 0;
 static bool voiceContactChosen = false, voiceListening = false;
 static Message messages[MAX_MESSAGES];
-static char lastIncomingId[2][48] = {};
-static bool inboxPrimed[2] = {};
 static uint32_t lastInboxPollAt = 0;
 static volatile bool inboxCheckRequested = true;
 static bool screenLocked = false;
@@ -103,11 +101,10 @@ static volatile bool diceFaceReady[6] = {};
 static int diceFaceBox[6][4] = {};
 static uint16_t *diceAnim = nullptr;
 static uint16_t *animCanvas = nullptr;
-static int diceAnimBox[6][ROLL_FRAMES][4] = {};
-static volatile bool diceAnimReady[6] = {};
-static bool rollUsesCache = false;
-static uint8_t rollCacheFrame = 0;
+static volatile bool diceAnimReady = false;
 static uint32_t rollCacheNextAt = 0;
+static int rollFromValue = 1, rollToValue = 1;
+static bool lockReleaseArmed = false;
 // All UI primitives render to RAM first. CO5300 QSPI corrupts odd-size
 // per-pixel writes; one aligned 480x480 transfer avoids those artifacts.
 struct UiCanvas {
@@ -188,16 +185,6 @@ static void drawText(const char *s, int x, int y, uint16_t color, int scale = 1)
   int cx = x;
   while (*s) {
     uint32_t cp = utf8Next(s);
-    if (cp < 128) {
-      int size = scale == 1 ? 2 : 3;
-      for (int col = 0; col < 5; col++) {
-        uint8_t bits = pgm_read_byte(&font[cp * 5 + col]);
-        for (int row = 0; row < 7; row++) if (bits & (1 << row))
-          ui.fillRect(cx + col * size, y + 4 * scale + row * size,
-                      size, size, color);
-      }
-      cx += 6 * size; continue;
-    }
     int lo = 0, hi = (int)(sizeof(ZH_CODES) / sizeof(ZH_CODES[0])) - 1;
     while (lo <= hi) {
       int m = (lo + hi) / 2;
@@ -206,14 +193,23 @@ static void drawText(const char *s, int x, int y, uint16_t color, int scale = 1)
       else { lo = m; break; }
     }
     if (lo < (int)(sizeof(ZH_CODES) / sizeof(ZH_CODES[0])) && ZH_CODES[lo] == cp) {
-      for (int py = 0; py < 24; py++) for (int px = 0; px < 24; px++) {
-        if (pgm_read_byte(&ZH_BITS[lo][py * 3 + px / 8]) & (0x80 >> (px & 7))) {
-          if (scale == 1) ui.drawPixel(cx + px, y + py, color);
-          else ui.fillRect(cx + px * scale, y + py * scale, scale, scale, color);
-        }
+      int cell = scale == 1 ? 32 : 40;
+      const uint8_t *glyph = scale == 1 ? ZH_ALPHA_32[lo] : ZH_ALPHA_40[lo];
+      for (int py = 0; py < cell; py++) for (int px = 0; px < cell; px++) {
+        int xx=cx+px, yy=y+py;
+        if ((unsigned)xx>=SCR_W || (unsigned)yy>=SCR_H) continue;
+        int bit=py*cell+px;
+        uint8_t packed=pgm_read_byte(glyph+bit/2);
+        int a=(bit&1)?(packed&15):(packed>>4);
+        if (!a) continue;
+        uint16_t bg=diceBig[yy*SCR_W+xx];
+        int r=(((color>>11)&31)*a+((bg>>11)&31)*(15-a)+7)/15;
+        int g=(((color>>5)&63)*a+((bg>>5)&63)*(15-a)+7)/15;
+        int b=((color&31)*a+(bg&31)*(15-a)+7)/15;
+        ui.drawPixel(xx,yy,(r<<11)|(g<<5)|b);
       }
     }
-    cx += 24 * scale;
+    cx += cp >= 32 && cp < 127 ? (scale == 1 ? ASCII_ADV_32[cp-32] : ASCII_ADV_40[cp-32]) : (scale == 1 ? 32 : 40);
   }
 }
 static void line(int x, int y, int w, uint16_t color = C_LINE) {
@@ -225,79 +221,35 @@ static void pill(int x, int y, int w, int h, uint16_t fill, uint16_t border = C_
 }
 static void drawBack(const char *title) {
   ui.fillRect(0, 0, SCR_W, 65, C_BG);
-  drawText("<", 22, 20, C_WHITE);
+  ui.fillTriangle(22,32,38,18,38,46,C_WHITE);
   drawText(title, 74, 19, C_WHITE);
   line(0, 64, SCR_W);
 }
 static void drawHome() {
   ui.fillScreen(C_BG);
   ui.fillRoundRect(28, 25, 424, 89, 24, C_CARD);
-  drawText("家庭小站", 54, 45, C_WHITE);
-  drawText("DICE + VOICE", 54, 82, C_MUTED);
-  pill(28, 136, 424, 132, 0x3908, 0x792C);
+  drawText("家庭小站", 54, 39, C_WHITE);
+
+  pill(28, 136, 424, 132, 0xFE12, 0xFE12);
   ui.fillCircle(87, 202, 37, C_RED);
   ui.fillCircle(78, 194, 6, C_WHITE); ui.fillCircle(98, 212, 6, C_WHITE);
-  drawText("骰子", 158, 166, C_WHITE, 2);
-  drawText("轻触或摇一摇", 160, 228, C_MUTED);
-  pill(28, 286, 424, 132, 0x1268, 0x2C73);
+  drawText("摇骰子", 158, 180, C_WHITE, 2);
+
+  pill(28, 286, 424, 132, 0xAF19, 0xAF19);
   ui.fillCircle(87, 352, 37, C_TEAL);
   ui.fillRoundRect(78, 334, 18, 28, 8, C_BG);
   ui.fillRect(86, 362, 3, 12, C_BG);
-  drawText("语音信箱", 158, 316, C_WHITE);
-  drawText("给家人留一段话", 160, 368, C_MUTED);
+  drawText("说说话", 158, 330, C_WHITE, 2);
+
   drawText("设置", 354, 442, C_MUTED);
   ui.flush();
 }
 static inline uint16_t avg565(uint16_t a, uint16_t b) {
   return ((a & 0xF7DE) >> 1) + ((b & 0xF7DE) >> 1);
 }
-static dice::Quat rollCachePose(float u) {
-  u = u < 0 ? 0 : (u > 1 ? 1 : u);
-  float ease = 1.0f - powf(1.0f - u, 3.0f);
-  dice::Quat settled = diceStartQ;
-  float d = fabsf(settled.w * diceTargetQ.w + settled.x * diceTargetQ.x +
-                  settled.y * diceTargetQ.y + settled.z * diceTargetQ.z);
-  if (d > 0.9999f) {
-    int alt = (diceValue % 6) + 1;
-    settled = dice::targetForValue(alt, 0.1f);
-    float qdot = settled.w * diceTargetQ.w + settled.x * diceTargetQ.x +
-                 settled.y * diceTargetQ.y + settled.z * diceTargetQ.z;
-    if (qdot < 0) settled = {-settled.w, -settled.x, -settled.y, -settled.z};
-  }
-  float qdot = settled.w * diceTargetQ.w + settled.x * diceTargetQ.x +
-               settled.y * diceTargetQ.y + settled.z * diceTargetQ.z;
-  if (qdot < 0) settled = {-settled.w, -settled.x, -settled.y, -settled.z};
-  // First rotate under the throw, then settle into the requested upward face.
-  float swing = sinf(ease * PI);
-  dice::Quat flight = dice::qaxis(dice::v3(0.72f, 0.33f, 0.61f), 2.0f * PI * ease);
-  dice::Quat base = {
-    settled.w * (1.0f - ease) + diceTargetQ.w * ease,
-    settled.x * (1.0f - ease) + diceTargetQ.x * ease,
-    settled.y * (1.0f - ease) + diceTargetQ.y * ease,
-    settled.z * (1.0f - ease) + diceTargetQ.z * ease
-  };
-  dice::Quat hop = dice::qaxis(dice::v3(-0.25f, 0.08f, 0.18f), 0.48f * swing);
-  return dice::qnorm(dice::qmul(flight, dice::qmul(hop, base)));
-}
-static void drawCachedRollFrame(int idx) {
-  if (!diceAnim || !animCanvas || !diceAnimReady[diceValue - 1] || idx < 0 || idx >= ROLL_FRAMES) return;
-  const uint16_t *src = diceAnim + (size_t)(diceValue - 1) * ROLL_FRAMES * ROLL_RES * ROLL_RES;
-  const int *box = diceAnimBox[diceValue - 1][idx];
-  memset(animCanvas, 0, (size_t)SCR_W * SCR_H * sizeof(uint16_t));
-  int cropX = max(0, box[0] - 3);
-  int cropY = max(0, box[1] - 3);
-  int cropW = min(ROLL_RES - cropX, box[2] - cropX + 4);
-  int cropH = min(ROLL_RES - cropY, box[3] - cropY + 4);
-  for (int dy = 0; dy < SCR_H; dy++) {
-    int sy = cropY + dy / 3;
-    if (sy >= cropY + cropH) break;
-    const uint16_t *row = src + (size_t)sy * ROLL_RES + cropX;
-    for (int dx = 0; dx < SCR_W; dx++) {
-      int sx = dx / 3;
-      if (sx >= cropW) break;
-      animCanvas[(size_t)dy * SCR_W + dx] = row[sx];
-    }
-  }
+static void drawCachedRollFrame(int idx, int lift = 0) {
+  if (!diceAnim || !animCanvas || !diceAnimReady || idx < 0 || idx >= ROLL_FRAMES) return;
+  rollmotion::compose(diceAnim, idx, lift, animCanvas);
   gfx->draw16bitRGBBitmap(0, 0, animCanvas, SCR_W, SCR_H);
 }
 static void drawDice() {
@@ -306,8 +258,8 @@ static void drawDice() {
   if (!rolling && diceFaces && diceFaceReady[diceValue - 1]) {
     memcpy(diceBig, diceFaces + (size_t)(diceValue - 1) * SCR_W * SCR_H,
            (size_t)SCR_W * SCR_H * sizeof(uint16_t));
-    pill(16, 4, 94, 36, C_CARD);
-    drawText("返回", 35, 10, C_WHITE);
+    pill(16, 4, 112, 48, C_CARD);
+    drawText("返回", 38, 12, C_WHITE);
     gfx->draw16bitRGBBitmap(0, 0, diceBig, SCR_W, SCR_H);
     const int *b = diceFaceBox[diceValue - 1];
     oldX0 = max(0, b[0] - 8); oldY0 = max(0, b[1] - 8);
@@ -316,47 +268,17 @@ static void drawDice() {
     safeLog(s);
     return;
   }
-  const int res = rolling ? 240 : SCR_W;
-  // The SDF renderer only clears its current bounds. Clear the entire frame so
-  // pixels from a previous pose or resolution cannot survive around the die.
-  uint16_t *frame = rolling ? diceLow : diceBig;
-  memset(frame, 0, (size_t)res * res * sizeof(uint16_t));
-  diceRenderer.buf = frame;
+  const int res = SCR_W;
+  memset(diceBig, 0, (size_t)SCR_W * SCR_H * sizeof(uint16_t));
+  diceRenderer.buf = diceBig;
   diceRenderer.W = diceRenderer.H = res;
   diceRenderer.p.focal = 800.0f;
-  diceRenderer.render(diceQ, rolling ? 0.22f * sinf((millis() - rollAt) * 0.003f) : 0);
+  diceRenderer.render(diceQ, 0);
   uint32_t t1 = millis();
-  int x0 = 0, y0 = 0, x1 = SCR_W - 1, y1 = SCR_H - 1;
-  if (rolling) {
-    // Motion renders at half display resolution; the resting frame is native 480.
-    int newX0 = max(0, diceRenderer.bboxX0 * SCR_W / res - 8);
-    int newY0 = max(0, diceRenderer.bboxY0 * SCR_H / res - 8);
-    int newX1 = min(SCR_W - 1, (diceRenderer.bboxX1 + 1) * SCR_W / res + 8);
-    int newY1 = min(SCR_H - 1, (diceRenderer.bboxY1 + 1) * SCR_H / res + 8);
-    x0 = min(newX0, oldX0) & ~1; y0 = min(newY0, oldY0) & ~1;
-    x1 = min(SCR_W - 1, max(newX1, oldX1) | 1);
-    y1 = min(SCR_H - 1, max(newY1, oldY1) | 1);
-    oldX0 = newX0; oldY0 = newY0; oldX1 = newX1; oldY1 = newY1;
-    int width = x1 - x0 + 1;
-    for (int y = y0; y <= y1; y++) {
-      int iy = y >> 1;
-      const uint16_t *src = diceLow + iy * res;
-      const uint16_t *next = diceLow + min(iy + 1, res - 1) * res;
-      uint16_t *dest = diceBig + (y - y0) * width;
-      for (int x = x0; x <= x1; x++) {
-        int ix = x >> 1, ix1 = min(ix + 1, res - 1);
-        uint16_t top = (x & 1) ? avg565(src[ix], src[ix1]) : src[ix];
-        if (y & 1) {
-          uint16_t bottom = (x & 1) ? avg565(next[ix], next[ix1]) : next[ix];
-          dest[x - x0] = avg565(top, bottom);
-        } else dest[x - x0] = top;
-      }
-    }
-  }
   uint32_t t2 = millis();
   if (!rolling) {
-    pill(16, 4, 94, 36, C_CARD);
-    drawText("返回", 35, 10, C_WHITE);
+    pill(16, 4, 112, 48, C_CARD);
+    drawText("返回", 38, 12, C_WHITE);
   }
   gfx->draw16bitRGBBitmap(0, 0, diceBig, SCR_W, SCR_H);
   uint32_t t3 = millis();
@@ -393,44 +315,32 @@ static void drawVoice() {
   ui.fillScreen(C_BG);
   if (voiceState == VOICE_RECORDING) {
     ui.fillScreen(C_RED);
-    drawText("正在说话", 144, 104, C_WHITE, 2);
+    drawText("正在说话", 160, 92, C_WHITE, 2);
     ui.fillCircle(240, 252, 60, C_WHITE);
     ui.fillRoundRect(230, 214, 20, 55, 10, C_RED);
     ui.fillRect(237, 270, 6, 22, C_RED);
-    drawText("0秒", 216, 344, C_WHITE);
-    drawText("松开发送", 192, 405, C_WHITE);
+    drawText("0秒", 208, 336, C_WHITE);
+    drawText("松开发送", 176, 398, C_WHITE);
     ui.flush(); return;
   }
-  if (!voiceContactChosen) {
-    drawBack("给谁说话");
-    for (int i = 0; i < 2; i++) {
-      int y = 126 + i * 166;
-      pill(28, y, 424, 138, C_CARD, CONTACTS[i].color);
-      drawContactAvatar(105, y + 69, i);
-      drawText(CONTACTS[i].name, 174, y + 49, C_WHITE, 2);
-    }
-    ui.flush(); return;
+  int sender = messageCount ? messages[0].sender : 0;
+  drawBack("家人");
+  if (messageCount) {
+    pill(24, 72, 432, 140, C_CARD, CONTACTS[sender].color);
+    drawContactAvatar(72, 142, sender);
+    char duration[32]; snprintf(duration, sizeof(duration), "%s %u秒", CONTACTS[sender].name, messages[0].seconds);
+    drawText(duration, 138, 90, C_WHITE);
+    drawText(voiceState == VOICE_PLAYING ? "正在播放" : "点一下重听", 138, 154, C_MUTED);
+    ui.fillTriangle(396, 122, 396, 162, 426, 142, C_TEAL);
   }
-  drawBack(contact == 0 ? "爸爸的语音" : "妈妈的语音");
-  if (messageCount == 0) {
-    pill(24, 78, 432, 94, C_CARD, CONTACTS[contact].color);
-    drawContactAvatar(74, 125, contact);
-    drawText("还没有语音", 142, 105, C_WHITE, 2);
-  } else {
-    pill(24, 72, 432, 112, C_CARD, CONTACTS[contact].color);
-    drawContactAvatar(72, 128, contact);
-    char duration[32]; snprintf(duration, sizeof(duration), "最新 %u秒", messages[0].seconds);
-    drawText(duration, 138, 88, C_WHITE, 2);
-    drawText(voiceState == VOICE_PLAYING ? "正在播放" : "点一下重听", 138, 139,
-             voiceState == VOICE_PLAYING ? C_TEAL : C_MUTED);
-    ui.fillTriangle(396, 108, 396, 148, 426, 128, C_TEAL);
-  }
-  ui.fillRoundRect(16, 214, 448, 248, 28, C_TEAL);
-  ui.fillCircle(240, 308, 50, C_WHITE);
-  ui.fillRoundRect(230, 278, 20, 47, 10, C_TEAL);
-  ui.fillRect(237, 322, 6, 19, C_TEAL);
+  const int top = messageCount ? 228 : 80;
+  const int height = 462 - top, center = top + height * 2 / 5;
+  ui.fillRoundRect(16, top, 448, height, 32, C_TEAL);
+  ui.fillCircle(240, center, 50, C_WHITE);
+  ui.fillRoundRect(230, center - 30, 20, 47, 10, C_TEAL);
+  ui.fillRect(237, center + 14, 6, 19, C_TEAL);
   drawText(voiceState == VOICE_SENDING ? "正在发送" : "按住说话",
-           130, 378, C_BG, 2);
+           160, top + height * 3 / 4, C_WHITE, 2);
   if (bannerUntil > millis() && banner[0]) {
     pill(76, 405, 328, 44, C_CARD);
     drawText(banner, 94, 414, C_WHITE);
@@ -445,7 +355,7 @@ static void drawVoiceResult(bool ok) {
     ui.fillTriangle(218, 301, 244, 326, 364, 178, C_WHITE);
     ui.fillTriangle(218, 301, 338, 152, 364, 178, C_WHITE);
   } else {
-    drawText("再试一次", 144, 216, C_WHITE, 2);
+    drawText("再试一次", 160, 216, C_WHITE, 2);
   }
   ui.flush();
 }
@@ -465,7 +375,7 @@ static void drawSettings() {
   pill(38, 340, 404, 60, C_CARD);
   drawText("重新配网", 55, 357, C_WHITE); drawText(">", 412, 357, C_MUTED);
   drawText(WiFi.status() == WL_CONNECTED ? "网络已连接" : "网络离线", 38, 420, C_MUTED);
-  drawText(serverBase, 38, 450, C_MUTED);
+
   ui.flush();
 }
 static void drawLocked() {
@@ -485,7 +395,7 @@ static void setPage(Page p) {
     rolling = false;
   }
   if (p == PAGE_VOICE && page != PAGE_VOICE) {
-    voiceContactChosen = false;
+    voiceContactChosen = true;
     voiceListening = false;
     inboxCheckRequested = true;
   }
@@ -570,6 +480,7 @@ static size_t recordAudio() {
   i2s_zero_dma_buffer(I2S_NUM_1);
   uint32_t start = millis(), lastDraw = start;
   size_t written = 0;
+  uint32_t lastFingerAt = start;
   int16_t raw[512];
   while (millis() - start < MAX_REC_MS && written + 256 <= pcmCap) {
     size_t got = 0;
@@ -579,15 +490,9 @@ static size_t recordAudio() {
         pcm[written++] = ((int32_t)raw[i] + raw[i + 1]) / 2;
     }
     uint32_t now = millis();
-    // IRQ edges can occur while a finger moves. Confirm a release by polling
-    // the controller twice before stopping the recording.
-    if (now - start > MIN_REC_MS) {
-      touchPending = false;
-      if (!touch.isPressed()) {
-        vTaskDelay(pdMS_TO_TICKS(45));
-        if (!touch.isPressed()) break;
-      }
-    }
+    int16_t heldX[2], heldY[2];
+    if (touch.getPoint(heldX, heldY, 2) > 0) lastFingerAt = now;
+    if (now - start > MIN_REC_MS && now - lastFingerAt > 220) break;
     if (now - lastDraw > 250) {
       lastDraw = now;
       char s[18]; snprintf(s, sizeof(s), "%u秒", (unsigned)((now - start) / 1000));
@@ -603,7 +508,7 @@ static bool uploadAudio(size_t count) {
   uint8_t *body = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
   if (!body) return false;
   wavHeader(body, count * 2); memcpy(body + 44, pcm, count * 2);
-  char url[180]; snprintf(url, sizeof(url), "%s/voice?to=%s", serverBase, CONTACTS[contact].key);
+  char url[180]; snprintf(url, sizeof(url), "%s/voice?to=%s", serverBase, "dad");
   WiFiClient client; HTTPClient http;
   bool ok = false;
   if (http.begin(client, url)) {
@@ -623,7 +528,7 @@ static void fetchMessages() {
   lastListAt = millis(); messageCount = 0;
   if (WiFi.status() != WL_CONNECTED) { drawVoice(); return; }
   inboxCheckRequested = false;
-  char url[184]; snprintf(url, sizeof(url), "%s/api/list?contact=%s&direction=in&limit=3", serverBase, CONTACTS[contact].key);
+  char url[184]; snprintf(url, sizeof(url), "%s/api/list?direction=in&limit=3", serverBase);
   WiFiClient client; HTTPClient http;
   if (!http.begin(client, url)) return;
   http.setReuse(false);
@@ -636,7 +541,7 @@ static void fetchMessages() {
       cJSON *item = nullptr;
       cJSON_ArrayForEach(item, items) {
         cJSON *c = cJSON_GetObjectItem(item, "contact");
-        if (!cJSON_IsString(c) || strcmp(c->valuestring, CONTACTS[contact].key)) continue;
+        if (!cJSON_IsString(c)) continue;
         cJSON *id = cJSON_GetObjectItem(item, "id");
         if (!cJSON_IsString(id)) continue;
         cJSON *direction = cJSON_GetObjectItem(item, "direction");
@@ -645,7 +550,7 @@ static void fetchMessages() {
         strlcpy(m.id, id->valuestring, sizeof(m.id));
         cJSON *seconds = cJSON_GetObjectItem(item, "seconds");
         m.seconds = cJSON_IsNumber(seconds) ? (uint16_t)ceil(seconds->valuedouble) : 0;
-        m.incoming = true;
+        m.incoming = true; m.sender = !strcmp(c->valuestring,"mom") ? 1 : 0;
         cJSON *ts = cJSON_GetObjectItem(item, "ts");
         m.ts = cJSON_IsNumber(ts) ? (uint32_t)(ts->valuedouble / 1000) : 0;
         if (++messageCount == MAX_MESSAGES) break;
@@ -694,8 +599,10 @@ static bool playMessage(int idx) {
         }
         playedBytes += got;
         int16_t stopX, stopY;
-        if (touchPoint(stopX, stopY)) break;
+        if (touchPoint(stopX, stopY) && stopY < 65) break;
       }
+      if (remaining) ok = false;
+      vTaskDelay(pdMS_TO_TICKS(150));
       i2s_zero_dma_buffer(I2S_NUM_1);
       digitalWrite(PA_PIN, LOW);
       }
@@ -711,46 +618,53 @@ static bool playMessage(int idx) {
   safeLog(report);
   return ok;
 }
+static void wakeScreen() {
+  if (!screenLocked) return;
+  screenLocked = false; gfx->displayOn(); gfx->setBrightness(brightness);
+  touchPending = false;
+}
+static void lockScreen() {
+  if (rolling) { diceValue=rollToValue; diceQ=diceTargetQ; rolling=false; }
+  diceSoundCancel=true;
+  screenLocked=true; lockReleaseArmed=false;
+  drawLocked(); ui.flush(); gfx->displayOff();
+  touchPending=false;
+}
 static void pollIncoming() {
-  if (WiFi.status() != WL_CONNECTED || rolling || diceSoundActive || voiceState != VOICE_READY) return;
-  if (page == PAGE_SETTINGS) return;
+  if (WiFi.status() != WL_CONNECTED || rolling || diceSoundActive || voiceState != VOICE_READY || (page == PAGE_SETTINGS && !screenLocked)) return;
   inboxCheckRequested = false;
-  for (int who = 0; who < 2; who++) {
-    char url[184];
-    snprintf(url, sizeof(url), "%s/api/list?contact=%s&direction=in&limit=1", serverBase, CONTACTS[who].key);
-    WiFiClient client; HTTPClient http;
-    if (!http.begin(client, url)) continue;
-  http.setReuse(false);
-  http.setConnectTimeout(1500);
-  http.setTimeout(1800);
-    int status = http.GET();
-    if (status != 200) { http.end(); continue; }
-    String body = http.getString();
-    http.end();
-    cJSON *root = cJSON_Parse(body.c_str());
-    cJSON *items = root ? cJSON_GetObjectItem(root, "items") : nullptr;
-    cJSON *item = cJSON_IsArray(items) ? cJSON_GetArrayItem(items, 0) : nullptr;
-    cJSON *id = item ? cJSON_GetObjectItem(item, "id") : nullptr;
-    if (cJSON_IsString(id) && id->valuestring && id->valuestring[0]) {
-      bool changed = inboxPrimed[who] && strcmp(lastIncomingId[who], id->valuestring);
-      strlcpy(lastIncomingId[who], id->valuestring, sizeof(lastIncomingId[who]));
-      inboxPrimed[who] = true;
-      cJSON_Delete(root);
-      if (changed) {
-        char logLine[90];
-        snprintf(logLine, sizeof(logLine), "[inbox] new %s id=%s\n", CONTACTS[who].key, lastIncomingId[who]);
-        safeLog(logLine);
-        setPage(PAGE_VOICE);
-        contact = who; voiceContactChosen = true; voiceListening = true;
-        fetchMessages();
-        if (messageCount && !strcmp(messages[0].id, lastIncomingId[who])) {
-          notice(who == 0 ? "爸爸发来语音" : "妈妈发来语音");
-          playMessage(0);
-        }
-        return;
+  WiFiClient client; HTTPClient http;
+  if (!http.begin(client, String(serverBase) + "/api/list?direction=in&limit=100")) return;
+  http.setConnectTimeout(1500); http.setTimeout(1800);
+  if (http.GET()!=200) { http.end(); return; }
+  String body=http.getString(); http.end();
+  cJSON *root=cJSON_Parse(body.c_str());
+  cJSON *items=root?cJSON_GetObjectItem(root,"items"):nullptr;
+  uint64_t cursor = prefs.getULong64("inbox-ts",0);
+  cJSON *next=nullptr; uint64_t nextTs=UINT64_MAX;
+  if(cJSON_IsArray(items)) {
+    cJSON *item=nullptr;
+    cJSON_ArrayForEach(item,items) {
+      cJSON *ts=cJSON_GetObjectItem(item,"ts");
+      if(cJSON_IsNumber(ts) && uint64_t(ts->valuedouble)>cursor && uint64_t(ts->valuedouble)<nextTs) {
+        next=item; nextTs=uint64_t(ts->valuedouble);
       }
-    } else { inboxPrimed[who] = true; cJSON_Delete(root); }
+    }
   }
+  if(next) {
+    cJSON *id=cJSON_GetObjectItem(next,"id"),*who=cJSON_GetObjectItem(next,"contact"),*seconds=cJSON_GetObjectItem(next,"seconds");
+    if(cJSON_IsString(id)) {
+      Message pending={}; strlcpy(pending.id,id->valuestring,sizeof(pending.id));
+      pending.sender=cJSON_IsString(who)&&!strcmp(who->valuestring,"mom")?1:0;
+      pending.seconds=cJSON_IsNumber(seconds)?uint16_t(ceil(seconds->valuedouble)):0;
+      pending.incoming=true;
+      wakeScreen(); page=PAGE_VOICE; voiceContactChosen=true;
+      messages[0]=pending; messageCount=1;
+      safeLog("[inbox] new family voice\n");
+      if(playMessage(0)) prefs.putULong64("inbox-ts",nextTs);
+    }
+  }
+  cJSON_Delete(root);
 }
 static void wifiPortal(bool force) {
   ui.fillScreen(C_BG); drawBack("配网");
@@ -825,103 +739,65 @@ static void diceCacheTask(void *) {
     vTaskDelay(1);
   }
   safeLog("[dice] six faces cached\n");
-  if (diceAnim) {
-    for (int face = 0; face < 6; face++) {
-      diceTargetQ = dice::targetForValue(face + 1, 0.1f);
-      for (int frame = 0; frame < ROLL_FRAMES; frame++) {
-        renderer.W = renderer.H = ROLL_RES;
-        renderer.p.focal = 800.0f;
-        renderer.buf = diceAnim + ((size_t)face * ROLL_FRAMES + frame) * ROLL_RES * ROLL_RES;
-        memset(renderer.buf, 0, (size_t)ROLL_RES * ROLL_RES * sizeof(uint16_t));
-        renderer.render(rollCachePose((float)frame / ROLL_FRAMES),
-                        0.20f * sinf((float)frame / ROLL_FRAMES * PI));
-        diceAnimBox[face][frame][0] = renderer.bboxX0;
-        diceAnimBox[face][frame][1] = renderer.bboxY0;
-        diceAnimBox[face][frame][2] = renderer.bboxX1;
-        diceAnimBox[face][frame][3] = renderer.bboxY1;
-        vTaskDelay(1);
-      }
-      diceAnimReady[face] = true;
-    }
-    safeLog("[dice] motion cache ready\n");
+  if (!diceAnim) { vTaskDelete(nullptr); return; }
+  diceAnimReady = false;
+  renderer.W = renderer.H = ROLL_RES;
+  renderer.p.focal = 800.0f;
+  for (int frame = 0; frame < ROLL_FRAMES; frame++) {
+    renderer.buf = diceAnim + (size_t)frame * ROLL_RES * ROLL_RES;
+    memset(renderer.buf, 0, (size_t)ROLL_RES * ROLL_RES * sizeof(uint16_t));
+    renderer.render(rollmotion::pose(frame), 0);
+    vTaskDelay(1);
   }
+  diceAnimReady = true;
+  safeLog("[dice] throw sequence ready\n");
   vTaskDelete(nullptr);
 }
 static void rollDice() {
   if (rolling) return;
-  diceValue = 1 + (esp_random() % 6);
-  diceStartQ = diceQ;
-  diceTargetQ = dice::targetForValue(diceValue, 0.1f);
-  rollAt = millis(); rolling = true; rollFrames = 0;
-  rollRenderMs = rollScaleMs = rollPushMs = 0;
-  rollUsesCache = diceAnim && animCanvas && diceAnimReady[diceValue - 1];
-  rollCacheFrame = 0;
-  rollCacheNextAt = rollAt + ROLL_MS / ROLL_FRAMES;
-  if (rollUsesCache) drawCachedRollFrame(0);
-  // Do not start I2S on the same frame as the first dice refresh while
-  // isolating the CO5300 corruption.
+  if (!diceAnimReady) { safeLog("[dice] cache preparing\n"); return; }
+  rollFromValue = diceValue;
+  rollToValue = 1 + (esp_random() % 6);
+  diceTargetQ = dice::targetForValue(rollToValue, 0.1f);
+  rolling = true; rollAt = millis(); rollFrames = 1;
+  rollCacheNextAt = rollAt + 80;
+  // The first transfer already changes physical pose. No digit swaps or rendering here.
+  drawCachedRollFrame(rollmotion::frameAt(rollFromValue, rollToValue, 0.045f), 10);
+  if (codecOk && !diceSoundActive) {
+    diceSoundCancel = false; diceSoundActive = true;
+    if (xTaskCreatePinnedToCore(diceSoundTask, "dice-sound", 4096, nullptr, 1, nullptr, 0) != pdPASS)
+      diceSoundActive = false;
+  }
 }
 static void updateDice() {
-  if (page == PAGE_DICE && rolling && rollUsesCache) {
-    if (millis() < rollCacheNextAt) return;
-    if (rollCacheFrame + 1 < ROLL_FRAMES) {
-      rollCacheFrame++;
-      drawCachedRollFrame(rollCacheFrame);
-      rollCacheNextAt = rollAt + (uint32_t)(rollCacheFrame + 1) * ROLL_MS / ROLL_FRAMES;
-      rollFrames++;
-      return;
-    }
-    diceQ = diceTargetQ;
-    rolling = false;
+  if (page != PAGE_DICE || !rolling || millis() < rollCacheNextAt) return;
+  float u = fminf(1.0f, float(millis() - rollAt) / ROLL_MS);
+  if (u >= 1) {
+    diceValue = rollToValue; diceQ = diceTargetQ; rolling = false;
     drawDice();
-    char s[100]; snprintf(s, sizeof(s), "[dice] cached %u frames in %lu ms\n",
-                          rollFrames, (unsigned long)(millis() - rollAt));
-    safeLog(s);
-    return;
+    char report[100]; snprintf(report, sizeof(report), "[dice] physical throw %u frames %lu ms result=%d\n",
+      rollFrames, (unsigned long)(millis()-rollAt), diceValue);
+    safeLog(report); return;
   }
-  if (page != PAGE_DICE || !rolling || millis() - diceFrameAt < 50) return;
-  diceFrameAt = millis();
-  float t = (millis() - rollAt) / 1000.0f;
-  if (t >= ROLL_MS / 1000.0f) {
-    diceQ = diceTargetQ;
-    rolling = false;
-  } else {
-    float ease = 1.0f - powf(1.0f - t * 1000.0f / ROLL_MS, 3.0f);
-    dice::Quat spin = dice::qaxis(dice::v3(0.64f, 0.78f, 0.21f), (1.0f - ease) * 6.5f);
-    diceQ = dice::qnorm(dice::qmul(spin, diceTargetQ));
-  }
-  drawDice();
-  if (rolling) rollFrames++;
-  if (!rolling) {
-    char s[120]; snprintf(s, sizeof(s), "[dice] %u motion frames in %lu ms\n",
-                          rollFrames, (unsigned long)(millis() - rollAt));
-    safeLog(s);
-  }
+  drawCachedRollFrame(rollmotion::frameAt(rollFromValue,rollToValue,u), rollmotion::liftAt(u));
+  rollFrames++;
+  rollCacheNextAt = rollAt + (uint32_t)(u * ROLL_MS / 80 + 1) * 80;
 }
 static void handleTap(int x, int y) {
   if (millis() - lastTouchAt < 260) return;
   lastTouchAt = millis();
   if (page == PAGE_HOME) {
     if (y >= 136 && y <= 268) setPage(PAGE_DICE);
-    else if (y >= 286 && y <= 418) setPage(PAGE_VOICE);
+    else if (y >= 286 && y <= 418) { setPage(PAGE_VOICE); fetchMessages(); }
     else if (y > 425) { settingsReturn = PAGE_HOME; setPage(PAGE_SETTINGS); }
   } else if (page == PAGE_DICE) {
     if (x < 120 && y < 75) setPage(PAGE_HOME); else rollDice();
   } else if (page == PAGE_VOICE) {
-    if (!voiceContactChosen) {
-      if (x < 70 && y < 65) setPage(PAGE_HOME);
-      else if (y >= 126 && y < 264) {
-        contact = 0; voiceContactChosen = true; voiceListening = false;
-        fetchMessages();
-      } else if (y >= 292 && y < 430) {
-        contact = 1; voiceContactChosen = true; voiceListening = false;
-        fetchMessages();
-      }
-    } else if (x < 70 && y < 65) {
-      voiceContactChosen = false; voiceListening = false; drawVoice();
-    } else if (y >= 72 && y < 184) {
+    if (x < 90 && y < 65) {
+      setPage(PAGE_HOME);
+    } else if (messageCount && y >= 72 && y < 212) {
       if (messageCount && !playMessage(0)) notice("播放失败");
-    } else if (y >= 214) {
+    } else if (y >= (messageCount ? 228 : 80)) {
       size_t n = recordAudio();
       bool sent = false;
       if (n >= SAMPLE_RATE * MIN_REC_MS / 1000) {
@@ -970,7 +846,7 @@ void setup() {
   diceLow = (uint16_t *)heap_caps_malloc(240 * 240 * 2, MALLOC_CAP_SPIRAM);
   diceBig = (uint16_t *)heap_caps_malloc(SCR_W * SCR_H * 2, MALLOC_CAP_SPIRAM);
   diceFaces = (uint16_t *)heap_caps_malloc((size_t)6 * SCR_W * SCR_H * 2, MALLOC_CAP_SPIRAM);
-  diceAnim = (uint16_t *)heap_caps_malloc((size_t)6 * ROLL_FRAMES * ROLL_RES * ROLL_RES * 2, MALLOC_CAP_SPIRAM);
+  diceAnim = (uint16_t *)heap_caps_malloc((size_t)ROLL_FRAMES * ROLL_RES * ROLL_RES * 2, MALLOC_CAP_SPIRAM);
   animCanvas = (uint16_t *)heap_caps_malloc((size_t)SCR_W * SCR_H * 2, MALLOC_CAP_SPIRAM);
   pcm = (int16_t *)heap_caps_malloc(pcmCap * 2, MALLOC_CAP_SPIRAM);
   if (!diceLow || !diceBig || !pcm) {
@@ -985,20 +861,31 @@ void setup() {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(100);
   if (WiFi.status() != WL_CONNECTED) wifiPortal(false);
-  if (WiFi.status() == WL_CONNECTED) pollIncoming();
+  if (WiFi.status() == WL_CONNECTED && !prefs.isKey("inbox-ts")) {
+    WiFiClient client; HTTPClient http;
+    if(http.begin(client,String(serverBase)+"/api/list?direction=in&limit=1")) {
+      http.setTimeout(2500);
+      if(http.GET()==200) {
+        cJSON *root=cJSON_Parse(http.getString().c_str());
+        cJSON *items=root?cJSON_GetObjectItem(root,"items"):nullptr;
+        cJSON *first=cJSON_IsArray(items)?cJSON_GetArrayItem(items,0):nullptr;
+        cJSON *ts=first?cJSON_GetObjectItem(first,"ts"):nullptr;
+        prefs.putULong64("inbox-ts",cJSON_IsNumber(ts)?uint64_t(ts->valuedouble):0);
+        cJSON_Delete(root);
+      }
+      http.end();
+    }
+  }
   safeLog("family-hub ready\n");
 }
 
 void loop() {
   if (screenLocked) {
-    if (digitalRead(KEY_PIN) == LOW || digitalRead(BOOT_PIN) == LOW) {
-      screenLocked = false;
-      bus->writeC8D8(0x53, 0x20);  // display on
-      gfx->setBrightness(brightness);
-      redraw();
-      delay(250);
-    } else delay(20);
-    return;
+    bool released = digitalRead(KEY_PIN)==HIGH && digitalRead(BOOT_PIN)==HIGH;
+    if (released) lockReleaseArmed = true;
+    if (lockReleaseArmed && !released) { wakeScreen(); redraw(); delay(200); }
+    if (millis()-lastInboxPollAt>5000) { lastInboxPollAt=millis(); pollIncoming(); }
+    delay(20); return;
   }
   if (USBSerial.available()) {
     char cmd = USBSerial.read();
@@ -1012,24 +899,28 @@ void loop() {
     }
     else if (cmd == 'p' && page == PAGE_VOICE) playMessage(0);
     else if (cmd == 'c') inboxCheckRequested = true;
+    else if (cmd == 'f') {
+      USBSerial.print("FRAME480\n");
+      USBSerial.write((uint8_t *)diceBig, SCR_W * SCR_H * 2);
+    }
+    else if (cmd == 'g') setPage(PAGE_SETTINGS);
+    else if (cmd == 'l') {
+      lockScreen();
+    }
     else if (cmd == 's') {
-      char s[100]; snprintf(s, sizeof(s), "[status] touch=%d imu=%d audio=%d codec=%d wifi=%d\n",
-                            touchOk, imuOk, audioOk, codecOk, WiFi.status() == WL_CONNECTED);
+      char s[160]; snprintf(s, sizeof(s), "[status] touch=%d imu=%d audio=%d codec=%d wifi=%d cache=%d psram=%u mac=%s\n",
+                            touchOk, imuOk, audioOk, codecOk, WiFi.status() == WL_CONNECTED, diceAnimReady, (unsigned)ESP.getFreePsram(), WiFi.macAddress().c_str());
       safeLog(s);
     }
   }
+  if (screenLocked) return;
   int16_t x, y;
   if (touchPoint(x, y)) handleTap(x, y);
   static int lastKey = HIGH, lastBoot = HIGH;
   static uint32_t bootAt = 0, lastShake = 0;
   int key = digitalRead(KEY_PIN), boot = digitalRead(BOOT_PIN);
   if (key == LOW && lastKey == HIGH) {
-    if (page == PAGE_DICE) rollDice();
-    else {
-      screenLocked = true;
-      bus->writeC8D8(0x53, 0x28);  // display off
-      drawLocked();
-    }
+    lockScreen(); lastKey=key; lastBoot=boot; return;
   }
   if (boot == LOW && lastBoot == HIGH) {
     if (millis() - bootAt < 430) setPage(PAGE_HOME);

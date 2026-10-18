@@ -14,3 +14,7 @@ build/
 *.bak
 *.swp
 *~
+
+# Reproducible simulator frames
+preview/frames/
+research/sources/
