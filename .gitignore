@@ -1,0 +1,16 @@
+# 编译产物
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Arduino / 编辑器
+.vscode/
+.idea/
+.DS_Store
+
+# 临时文件
+*.bak
+*.swp
+*~

@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>3D 骰子 · 红底白点</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: radial-gradient(circle at 50% 30%, #191a1e 0%, #0c0c0e 55%, #000 100%);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+    color: #e8e8ec; display: flex; align-items: center; justify-content: center;
+    padding: 24px 12px;
+  }
+  .wrap { display: flex; flex-direction: column; align-items: center; gap: 17px; }
+  .board {
+    position: relative; width: 480px; height: 480px;
+    border-radius: 30px; background: #000;
+    box-shadow: 0 0 0 1px #24242a, 0 0 0 9px #101014, 0 0 0 10px #2c2c34,
+                0 34px 90px -24px rgba(0,0,0,.95);
+    overflow: hidden; cursor: pointer; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .board canvas { display: block; width: 480px; height: 480px; border-radius: 30px; }
+  .hud {
+    position: absolute; left: 0; right: 0; top: 0; display: flex; justify-content: space-between;
+    padding: 13px 17px; font-size: 11px; letter-spacing: .06em; color: #4a4a54;
+    pointer-events: none; font-variant-numeric: tabular-nums;
+  }
+  .result {
+    position: absolute; left: 0; right: 0; bottom: 0; text-align: center; padding: 15px 0 17px;
+    font-size: 12px; letter-spacing: .18em; color: #3e3e48; pointer-events: none; transition: color .3s;
+  }
+  .result.live { color: #d2d2dc; }
+  .result b { font-size: 23px; letter-spacing: 0; margin-left: 7px; vertical-align: -2px; }
+  .btns { display: flex; gap: 9px; flex-wrap: wrap; justify-content: center; }
+  button {
+    appearance: none; border: 1px solid #2b2b35; background: #14141a; color: #c2c2ce;
+    padding: 9px 17px; border-radius: 9px; font-size: 13px; cursor: pointer;
+    transition: background .15s, border-color .15s, transform .08s; font-family: inherit;
+  }
+  button:hover { background: #1c1c24; border-color: #3a3a46; }
+  button:active { transform: scale(.97); }
+  button.on { background: #23232c; border-color: #4a4a58; color: #e4e4ee; }
+  .hint { font-size: 12.5px; color: #63636f; display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
+  .hint kbd {
+    background: #191920; border: 1px solid #2b2b35; border-bottom-width: 2px; border-radius: 5px;
+    padding: 2px 6px; font-size: 11px; color: #a8a8b6; font-family: ui-monospace, Menlo, monospace;
+  }
+  .spec { font-size: 11px; color: #45454f; line-height: 1.7; text-align: center; max-width: 545px; }
+  .spec code { color: #6a6a78; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="board" id="board">
+    <canvas id="cv" width="480" height="480"></canvas>
+    <div class="hud"><span id="fps">-- FPS</span><span id="ms">-- ms</span></div>
+    <div class="result" id="result">点击屏幕掷骰</div>
+  </div>
+  <div class="btns">
+    <button id="btnRoll">🎲 掷骰</button>
+    <button id="btnSound" class="on">🔊 声音 开</button>
+  </div>
+  <div class="hint"><span><kbd>点击</kbd> / <kbd>空格</kbd> / <kbd>Enter</kbd> 掷骰</span></div>
+  <div class="spec">
+    <b>真几何（SDF 光线步进）</b>：圆角盒 · 12 圆柱棱 + 8 球角由几何自动生成 · 白点是球面凹坑<br>
+    <code>rounded-box SDF · 法线=梯度 · AO=法线方向距离采样 · 点数看顶面 · 落地软阴影</code>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ============================================================ 参数
+const SCR_W = 480, SCR_H = 480;
+const FOCAL = 660.0;
+const CAM_Z = 5.3;
+const H = 0.5;           // 半边长
+const R = 0.088;         // 圆角半径（16mm 骰子约 1.4mm ≈ 0.088）
+const BOX = H - R;       // 内盒半边长（SDF 的 b）
+
+const PIP_OFF = 0.29;
+const PIP_RAD = 0.098;
+const PIP_DEPTH = 0.34;  // 坑深 / 半径
+
+const SPIN_MS = 780, ROLL_MS = 1150;
+const TILT_X = -0.50, TILT_Y = 0.55;   // 三分之四视角（实测三面 48/27/25%）
+
+// 红底白点
+const BODY = [214, 38, 38];
+const PIP_WHITE = [252, 250, 246];
+const PIP_WHITE_DIM = [240, 236, 230];
+const LIGHT = norm({x:-0.38, y:0.70, z:-0.60});
+
+// ============================================================ 数学
+function v3(x,y,z){ return {x,y,z}; }
+function add(a,b){ return {x:a.x+b.x,y:a.y+b.y,z:a.z+b.z}; }
+function sub(a,b){ return {x:a.x-b.x,y:a.y-b.y,z:a.z-b.z}; }
+function mul(a,s){ return {x:a.x*s,y:a.y*s,z:a.z*s}; }
+function dot(a,b){ return a.x*b.x+a.y*b.y+a.z*b.z; }
+function cross(a,b){ return {x:a.y*b.z-a.z*b.y,y:a.z*b.x-a.x*b.z,z:a.x*b.y-a.y*b.x}; }
+function len(a){ return Math.sqrt(dot(a,a)); }
+function norm(a){ const l=len(a); return l>1e-9?mul(a,1/l):v3(0,0,0); }
+
+function qmul(a,b){ return {
+  w:a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z,
+  x:a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+  y:a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,
+  z:a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w }; }
+function qnorm(q){ const l=Math.sqrt(q.w*q.w+q.x*q.x+q.y*q.y+q.z*q.z);
+  if(l<1e-9) return {w:1,x:0,y:0,z:0}; const s=1/l;
+  return {w:q.w*s,x:q.x*s,y:q.y*s,z:q.z*s}; }
+function qaxis(ax,ang){ const a=norm(ax),h=ang*0.5,s=Math.sin(h);
+  return {w:Math.cos(h),x:a.x*s,y:a.y*s,z:a.z*s}; }
+function qfromto(a,b){ a=norm(a);b=norm(b);const d=dot(a,b);
+  if(d>0.99999) return {w:1,x:0,y:0,z:0};
+  if(d<-0.99999){ let ax=cross(a,v3(1,0,0));
+    if(len(ax)<1e-4) ax=cross(a,v3(0,1,0)); ax=norm(ax);
+    return {w:0,x:ax.x,y:ax.y,z:ax.z}; }
+  const ax=cross(a,b); return qnorm({w:1+d,x:ax.x,y:ax.y,z:ax.z}); }
+function qrot(v,q){ const u=v3(q.x,q.y,q.z); const t=mul(cross(u,v),2);
+  return add(add(v,mul(t,q.w)),cross(u,t)); }
+function qconj(q){ return {w:q.w,x:-q.x,y:-q.y,z:-q.z}; }
+function qslerp(a,b,t){ let d=a.w*b.w+a.x*b.x+a.y*b.y+a.z*b.z;
+  if(d<0){ b={w:-b.w,x:-b.x,y:-b.y,z:-b.z}; d=-d; }
+  if(d>0.9995) return qnorm({w:a.w+(b.w-a.w)*t,x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:a.z+(b.z-a.z)*t});
+  const th=Math.acos(d),s=Math.sin(th);
+  const s0=Math.sin((1-t)*th)/s, s1=Math.sin(t*th)/s;
+  return qnorm({w:a.w*s0+b.w*s1,x:a.x*s0+b.x*s1,y:a.y*s0+b.y*s1,z:a.z*s0+b.z*s1}); }
+
+// ============================================================ 骰子面（对面和=7）
+// 西方标准骰子（右手 / CCW）：1 朝前(+Z)、2 朝上(+Y) 时，4 在右(+X)、3 在左(-X)
+//   口诀「1 up, 2 left, 3 right」→ 从 1-2-3 角外侧看 1→2→3 为逆时针
+//   对面和恒为 7：1-6 / 2-5 / 3-4
+//   ⚠️ 早期版本把 +X=3 / -X=4，那是中式镜像（CW），已按 PDF 原始资料纠正
+const AXES = [
+  { n:v3(0,0,1),  r:v3(1,0,0),  u:v3(0,1,0),  val:1 },
+  { n:v3(0,0,-1), r:v3(-1,0,0), u:v3(0,1,0),  val:6 },
+  { n:v3(1,0,0),  r:v3(0,0,-1), u:v3(0,1,0),  val:4 },
+  { n:v3(-1,0,0), r:v3(0,0,1),  u:v3(0,1,0),  val:3 },
+  { n:v3(0,1,0),  r:v3(1,0,0),  u:v3(0,0,-1), val:2 },
+  { n:v3(0,-1,0), r:v3(1,0,0),  u:v3(0,0,1),  val:5 },
+];
+
+const PIPS = [
+  [], [[0,0]],
+  [[-PIP_OFF,-PIP_OFF],[PIP_OFF,PIP_OFF]],
+  [[-PIP_OFF,-PIP_OFF],[0,0],[PIP_OFF,PIP_OFF]],
+  [[-PIP_OFF,-PIP_OFF],[PIP_OFF,-PIP_OFF],[-PIP_OFF,PIP_OFF],[PIP_OFF,PIP_OFF]],
+  [[-PIP_OFF,-PIP_OFF],[PIP_OFF,-PIP_OFF],[0,0],[-PIP_OFF,PIP_OFF],[PIP_OFF,PIP_OFF]],
+  [[-PIP_OFF,-PIP_OFF],[PIP_OFF,-PIP_OFF],[-PIP_OFF,0],[PIP_OFF,0],[-PIP_OFF,PIP_OFF],[PIP_OFF,PIP_OFF]],
+];
+
+// 每个面 6 个点坑的局部坐标（预展开，避免每像素数组迭代）
+const FACE_PIPS = AXES.map(ax => {
+  const list = PIPS[ax.val];
+  const out = [];
+  for (const [a,b] of list) out.push(a,b);
+  return new Float64Array(out);
+});
+
+// ============================================================ 颜色
+function pack(r,g,b){
+  r=r<0?0:r>255?255:r|0; g=g<0?0:g>255?255:g|0; b=b<0?0:b>255?255:b|0;
+  return (255<<24)|(b<<16)|(g<<8)|r;
+}
+function shade(base, n, ao, spec){
+  const lam = Math.max(0, dot(n, LIGHT));
+  const hemi = 0.5 + 0.5*n.y;
+  let k = 0.42 + 0.22*hemi + 0.36*lam;
+  k *= ao;
+  if (k > 1.02) k = 1.02;
+  const lift = v => { let t=v*k; t = t + (253-t)*spec; return t>251?251:t; };
+  return [lift(base[0]), lift(base[1]), lift(base[2])];
+}
+
+// ============================================================ SDF：圆角盒
+// 标准 rounded-box SDF：球体扫掠盒，自动产生 12 圆柱棱 + 8 球角
+function sdfBox(p){
+  const qx = Math.abs(p.x) - BOX;
+  const qy = Math.abs(p.y) - BOX;
+  const qz = Math.abs(p.z) - BOX;
+  const mx = qx>0?qx:0, my = qy>0?qy:0, mz = qz>0?qz:0;
+  const outside = Math.sqrt(mx*mx + my*my + mz*mz);
+  const insideMax = Math.max(qx, Math.max(qy, qz));
+  const insideMin = Math.min(insideMax, 0);
+  return outside + insideMin - R;
+}
+
+// SDF 法线：四面体梯度
+const TET = [
+  [ 1,-1,-1], [-1,-1, 1], [-1, 1,-1], [ 1, 1, 1]
+];
+function sdfNormal(p){
+  let nx=0, ny=0, nz=0;
+  const e = 0.0006;
+  for (const [dx,dy,dz] of TET) {
+    const q = { x:p.x+dx*e, y:p.y+dy*e, z:p.z+dz*e };
+    const d = sdfBox(q);
+    nx += dx*d; ny += dy*d; nz += dz*d;
+  }
+  return norm(v3(nx,ny,nz));
+}
+
+// ============================================================ 点坑（在命中面的局部坐标里判定）
+// 返回 null 或 {depth, nx, ny} （相对面法线的径向倾斜 + 法向）
+const _pip = { depth:0, nx:0, ny:0, nz:1, t:0, hit:false };
+function pipLocal(a, b, pipArr){
+  for (let i = 0; i < pipArr.length; i += 2) {
+    const da = a - pipArr[i], db = b - pipArr[i+1];
+    const d2 = da*da + db*db;
+    const r2 = PIP_RAD*PIP_RAD;
+    if (d2 >= r2) continue;
+    const d = Math.sqrt(d2);
+    const t = d / PIP_RAD;
+    const s = Math.sqrt(Math.max(1e-6, 1 - t*t));
+    // 半球坑：depth = PIP_DEPTH * PIP_RAD * s
+    _pip.depth = PIP_DEPTH * PIP_RAD * s;
+    // 斜率 dw/dd
+    const slope = PIP_DEPTH * t / Math.max(1e-3, s);
+    const ux = d > 1e-9 ? da/d : 0;
+    const uy = d > 1e-9 ? db/d : 0;
+    const nl = Math.sqrt(slope*slope + 1);
+    _pip.nx = slope*ux/nl;
+    _pip.ny = slope*uy/nl;
+    _pip.nz = 1/nl;
+    _pip.t = t;
+    _pip.hit = true;
+    return _pip;
+  }
+  return null;
+}
+
+// ============================================================ 画布
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha:false });
+const img = ctx.createImageData(SCR_W, SCR_H);
+const px = new Uint32Array(img.data.buffer);
+
+// ============================================================ 状态
+let qCur = {w:1,x:0,y:0,z:0};
+let qTarget = {w:1,x:0,y:0,z:0};
+let qSlerpFrom = {w:1,x:0,y:0,z:0};
+let spinAxis = v3(1,0,0);
+let spinSpeed = 12;
+let mode = 'IDLE';
+let rollStart = 0, lastMs = 0, lastValue = 0, hopY = 0;
+
+// 每帧预算给渲染函数的常量（避免闭包开销）
+let qInv = {w:1,x:0,y:0,z:0};   // 世界 -> 物体
+let centerY = 0;                // 骰子中心的世界 y
+
+// ============================================================ 主渲染：光线步进
+function renderDice(q, yOff){
+  px.fill(0xff000000);
+
+  qInv = qconj(q);
+  centerY = yOff;
+
+  // 骰子世界中心 = (0, yOff, CAM_Z)
+  const cx = 0, cy = yOff, cz = CAM_Z;
+  const bound = H * 1.78;   // 包围球半径（sqrt3 * H）
+
+  // 屏幕包围盒：投影 8 个角
+  let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  for (let i = 0; i < 8; i++) {
+    const s = [(i&1)?1:-1, (i&2)?1:-1, (i&4)?1:-1];
+    const p = qrot(v3(s[0]*H, s[1]*H, s[2]*H), q);
+    const wz = p.z + CAM_Z;
+    if (wz <= 0.3) continue;
+    const sx = SCR_W*0.5 + FOCAL*p.x/wz;
+    const sy = SCR_H*0.5 - FOCAL*(p.y + yOff)/wz;
+    if (sx<minX) minX=sx; if (sx>maxX) maxX=sx;
+    if (sy<minY) minY=sy; if (sy>maxY) maxY=sy;
+  }
+  const bx0 = Math.max(0, Math.floor(minX)-2), bx1 = Math.min(SCR_W-1, Math.ceil(maxX)+2);
+  const by0 = Math.max(0, Math.floor(minY)-2), by1 = Math.min(SCR_H-1, Math.ceil(maxY)+2);
+
+  drawGroundShadow(q, yOff);
+
+  // ---- 逐像素光线步进
+  for (let y = by0; y <= by1; y++) {
+    const syv = SCR_H*0.5 - (y + 0.5);
+    for (let x = bx0; x <= bx1; x++) {
+      const sxv = (x + 0.5) - SCR_W*0.5;
+
+      // 射线方向（归一化）
+      let dx = sxv/FOCAL, dy = syv/FOCAL, dz = 1;
+      const dl = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      dx/=dl; dy/=dl; dz/=dl;
+
+      // 相机在原点，射线 P(t) = dir * t
+      // 包围球（球心 = 骰子世界中心）求交
+      const ox = -cx, oy = -cy, oz = -cz;
+      const bq = ox*dx + oy*dy + oz*dz;
+      const cq = ox*ox + oy*oy + oz*oz - bound*bound;
+      const disc = bq*bq - cq;
+      if (disc < 0) continue;
+      const sq = Math.sqrt(disc);
+      let t = -bq - sq;
+      if (t < 0) t = 0;
+      const tEnd = -bq + sq;
+
+      // marching（物体空间里求交）
+      let hit = false;
+      for (let step = 0; step < 56; step++) {
+        const pxw = dx*t, pyw = dy*t, pzw = dz*t;
+        // 世界 -> 物体：减骰子中心（0, yOff, CAM_Z），再反旋转
+        const lp = qrot(v3(pxw - cx, pyw - cy, pzw - cz), qInv);
+        const d = sdfBox(lp);
+        if (d < 0.0008) { hit = true; break; }
+        t += d * 0.92;
+        if (t > tEnd) break;
+      }
+      if (!hit) continue;
+
+      // 命中点（世界）
+      // 命中点：世界坐标 = dir*t，物体坐标 = 世界 - 骰子中心（再反旋转）
+      const lp = qrot(v3(dx*t - cx, dy*t - cy, dz*t - cz), qInv);
+
+      // 法线（物体空间 SDF 梯度）→ 世界
+      const nObj = sdfNormal(lp);
+
+      // ---- 判定是否落在点坑里
+      // 主导轴 = |n| 最大分量 → 该面
+      const ax = Math.abs(nObj.x), ay = Math.abs(nObj.y), az = Math.abs(nObj.z);
+      let fi = 0, sign = 1;
+      if (ax >= ay && ax >= az) { sign = nObj.x >= 0 ? 1 : -1; fi = sign > 0 ? 2 : 3; }
+      else if (ay >= ax && ay >= az) { sign = nObj.y >= 0 ? 1 : -1; fi = sign > 0 ? 4 : 5; }
+      else { sign = nObj.z >= 0 ? 1 : -1; fi = sign > 0 ? 0 : 1; }
+
+      // 面内局部坐标
+      const axis = AXES[fi];
+      const pu = dot(lp, axis.r);
+      const pv = dot(lp, axis.u);
+
+      let base = BODY;
+      let specAmt = 0.14;
+      let nFinal = nObj;      // 物体空间最终法线
+      let inPip = false;      // 是否落在点坑内（坑内走白漆专用着色）
+      let pipBase = PIP_WHITE; // 白漆基色
+      let ao = 1.0;
+
+      const pipArr = FACE_PIPS[fi];
+      if (pipArr.length) {
+        const pp = pipLocal(pu, pv, pipArr);
+        if (pp) {
+          inPip = true;
+          // 坑法线（物体空间）：面法线 * nz - 面内径向 * slope
+          const nAxis = mul(axis.n, sign);
+          const radial = add(mul(axis.r, pp.nx), mul(axis.u, pp.ny));
+          nFinal = norm(sub(mul(nAxis, pp.nz), radial));
+          pipBase = PIP_WHITE;   // 白漆本色，明暗交给后面统一处理
+          specAmt = 0.06;
+        }
+      }
+
+      // ---- 着色
+      // 白漆点必须「任何一面都是白的」：独立着色，不吃骰身 AO/材质压暗
+      let rgb;
+      const nW = qrot(nFinal, q);
+      if (inPip) {
+        // 坑内白漆：只按局部朝向做很轻的明暗，且下限很高（永远保持白）
+        const lam = Math.max(0, dot(nW, LIGHT));
+        const k = 0.86 + 0.14*lam;      // 0.86 ~ 1.0，最暗也是亮白
+        const lift = v => { let t = v*k; t = t + (253-t)*0.05; return t > 253 ? 253 : t; };
+        rgb = [lift(pipBase[0]), lift(pipBase[1]), lift(pipBase[2])];
+      } else {
+        let scale = 1.0, occ = 0;
+        for (let k = 1; k <= 4; k++) {
+          const hd = 0.008 + 0.055*(k-1);
+          const p2 = add(lp, mul(nFinal, hd));
+          const dd = sdfBox(p2);
+          occ += (hd - dd) * scale;
+          scale *= 0.72;
+        }
+        ao = 1.0 - Math.max(0, Math.min(1, occ*7.0));
+        ao = 0.30 + 0.70*ao;
+        rgb = shade(base, nW, ao, specAmt);
+      }
+
+      px[y*SCR_W + x] = pack(rgb[0], rgb[1], rgb[2]);
+    }
+  }
+
+  ctx.putImageData(img, 0, 0);
+}
+
+// ============================================================ 落地软阴影
+function drawGroundShadow(q, yOff){
+  const groundY = -0.60 - (0.42 - yOff > 0 ? 0 : 0);   // 地面固定在骰子下方
+  const gy = -0.62;
+  // 地面点 (0, gy, CAM_Z)
+  const wz = CAM_Z;
+  if (wz <= 0.2) return;
+  const scx = SCR_W*0.5;
+  const scy = SCR_H*0.5 - FOCAL*gy/wz;
+
+  // 骰子 x/z 最大半径
+  let rx = 0, rz = 0;
+  for (let i = 0; i < 8; i++) {
+    const s = [(i&1)?1:-1, (i&2)?1:-1, (i&4)?1:-1];
+    const p = qrot(v3(s[0]*H, s[1]*H, s[2]*H), q);
+    rx = Math.max(rx, Math.abs(p.x));
+    rz = Math.max(rz, Math.abs(p.z));
+  }
+  const sx = FOCAL*(rx*1.28)/wz;
+  const sy = FOCAL*(rz*1.28*0.40)/wz;
+
+  const lift = 0.30 * Math.max(0, yOff);   // 跳起时阴影变淡
+
+  const x0 = Math.max(0, Math.floor(scx - sx)), x1 = Math.min(SCR_W-1, Math.ceil(scx + sx));
+  const y0 = Math.max(0, Math.floor(scy - sy)), y1 = Math.min(SCR_H-1, Math.ceil(scy + sy));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const ddx = (x + 0.5 - scx)/Math.max(1, sx);
+      const ddy = (y + 0.5 - scy)/Math.max(1, sy);
+      const d = Math.sqrt(ddx*ddx + ddy*ddy);
+      if (d >= 1) continue;
+      const a = Math.pow(1 - d, 2.4) * (0.60 - lift);
+      if (a <= 0) continue;
+      const idx = y*SCR_W + x;
+      const o = px[idx];
+      px[idx] = pack((o&255)*(1-a), ((o>>8)&255)*(1-a), ((o>>16)&255)*(1-a));
+    }
+  }
+}
+
+// ============================================================ 目标姿态
+// 真实骰子：掷出的点数看的是「朝上」那一面，不是朝向相机那一面。
+//   1) 把该面法线对齐到世界 +Y（正上方）
+//   2) 用 TILT_X 把骰子前倾，让顶面转向相机（相机在原点朝 +Z 看）
+//   3) 绕 Y 轴的小角度 roll 只做面内微转，保证点数端正
+function targetForValue(v, rollAngle){
+  let fi = 0;
+  for (let i = 0; i < 6; i++) if (AXES[i].val === v) { fi = i; break; }
+  const align = qfromto(AXES[fi].n, v3(0,1,0));          // 该面朝上
+  const roll  = qaxis(v3(0,1,0), rollAngle);             // 面内自转（绕上轴）
+  const tilt  = qmul(qaxis(v3(1,0,0), TILT_X), qaxis(v3(0,1,0), TILT_Y));
+  return qnorm(qmul(tilt, qmul(roll, align)));
+}
+
+// ============================================================ 音效
+let audioCtx = null, soundOn = true;
+function ensureAudio(){
+  if (!audioCtx) { try { audioCtx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){} }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+function playClick(when, gain, pitch){
+  const ac = ensureAudio(); if (!ac || !soundOn) return;
+  const dur = 0.055, n = Math.max(1, Math.floor(ac.sampleRate*dur));
+  const buf = ac.createBuffer(1, n, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i=0;i<n;i++){ const k=1-i/n; d[i]=(Math.random()*2-1)*Math.pow(k,3.2); }
+  const src = ac.createBufferSource(); src.buffer = buf;
+  const bp = ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=pitch; bp.Q.value=1.1;
+  const ng = ac.createGain(); ng.gain.value = gain;
+  src.connect(bp).connect(ng).connect(ac.destination); src.start(when);
+
+  const osc = ac.createOscillator(); osc.type='triangle';
+  osc.frequency.setValueAtTime(pitch*0.55, when);
+  osc.frequency.exponentialRampToValueAtTime(pitch*0.30, when+0.07);
+  const og = ac.createGain();
+  og.gain.setValueAtTime(gain*0.55, when);
+  og.gain.exponentialRampToValueAtTime(0.0001, when+0.09);
+  osc.connect(og).connect(ac.destination); osc.start(when); osc.stop(when+0.11);
+}
+function playRattle(){
+  const ac = ensureAudio(); if (!ac || !soundOn) return;
+  let t = ac.currentTime + 0.02;
+  const n = 5 + (Math.random()*4|0);
+  for (let i=0;i<n;i++){ const p=i/n; playClick(t, 0.05+0.10*(1-p), 1500+Math.random()*900); t += 0.055+p*p*0.14; }
+}
+function playLand(){
+  const ac = ensureAudio(); if (!ac || !soundOn) return;
+  const t = ac.currentTime + 0.01;
+  playClick(t, 0.30, 900);
+  playClick(t+0.055, 0.14, 1250);
+}
+
+// ============================================================ 主循环
+let frames = 0, fpsT = 0, rms = 0;
+
+function startRoll(){
+  if (mode === 'ROLLING') return;
+  ensureAudio();
+  const v = 1 + (Math.random()*6 | 0);
+  lastValue = v;
+  let ax = v3(Math.random()*2-1, Math.random()*2-1, Math.random()*2-1);
+  if (len(ax) < 0.2) ax = v3(1,0.4,0.2);
+  spinAxis = norm(ax);
+  spinSpeed = 11 + Math.random()*7;
+  qTarget = targetForValue(v, (Math.random()-0.5)*0.24);
+  qSlerpFrom = qCur;
+  mode = 'ROLLING';
+  rollStart = performance.now();
+  lastMs = rollStart;
+  document.getElementById('result').classList.remove('live');
+  document.getElementById('result').textContent = '掷出中…';
+  playRattle();
+}
+
+function updateAnimation(now){
+  if (mode !== 'ROLLING') { qCur = qTarget; hopY = 0; return; }
+  const el = now - rollStart;
+  if (el < SPIN_MS) {
+    let dt = (now - lastMs)/1000; lastMs = now;
+    if (dt > 0.05) dt = 0.05;
+    qCur = qnorm(qmul(qCur, qaxis(spinAxis, spinSpeed*dt)));
+    hopY = 0.40*Math.sin((el/SPIN_MS)*Math.PI);
+    qSlerpFrom = qCur;
+  } else if (el < ROLL_MS) {
+    const t = (el-SPIN_MS)/(ROLL_MS-SPIN_MS);
+    qCur = qslerp(qSlerpFrom, qTarget, 1 - Math.pow(1-t, 3));
+    hopY = 0;
+  } else {
+    qCur = qTarget; hopY = 0;
+    if (mode === 'ROLLING') {
+      mode = 'IDLE';
+      const r = document.getElementById('result');
+      r.classList.add('live');
+      r.innerHTML = '点数<b>' + lastValue + '</b>';
+      playLand();
+    }
+  }
+}
+
+function loop(now){
+  const t0 = performance.now();
+  updateAnimation(now);
+  renderDice(qCur, hopY);
+  const dt = performance.now() - t0;
+  rms = rms ? rms*0.9 + dt*0.1 : dt;
+
+  frames++;
+  if (now - fpsT >= 500) {
+    document.getElementById('fps').textContent = Math.round(frames*1000/(now-fpsT)) + ' FPS';
+    document.getElementById('ms').textContent = rms.toFixed(1) + ' ms';
+    frames = 0; fpsT = now;
+  }
+  requestAnimationFrame(loop);
+}
+
+// ============================================================ 交互
+document.getElementById('board').addEventListener('click', startRoll);
+document.getElementById('btnRoll').addEventListener('click', startRoll);
+
+const btnSound = document.getElementById('btnSound');
+btnSound.addEventListener('click', (e) => {
+  e.stopPropagation();
+  soundOn = !soundOn;
+  btnSound.textContent = soundOn ? '🔊 声音 开' : '🔇 声音 关';
+  btnSound.classList.toggle('on', soundOn);
+  if (soundOn) { const ac = ensureAudio(); if (ac) playClick(ac.currentTime, 0.2, 1200); }
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); startRoll(); }
+  if (e.code === 'Enter') { e.preventDefault(); startRoll(); }
+});
+
+qTarget = targetForValue(1, 0.0);
+qCur = qTarget;
+document.getElementById('result').innerHTML = '点数<b>1</b>';
+document.getElementById('result').classList.add('live');
+
+requestAnimationFrame((t) => { fpsT = t; lastMs = t; loop(t); });
+</script>
+</body>
+</html>
