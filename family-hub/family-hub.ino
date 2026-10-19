@@ -582,6 +582,19 @@ static void fetchMessages() {
     cJSON_Delete(root);
   }
   http.end(); if (page == PAGE_VOICE) drawVoice();
+
+  // Showing a message in the family list must also play it. pollIncoming() owns
+  // playback but bails out while a roll, a sound, or a recording is running, so
+  // relying on it alone leaves fresh messages visible but silent. Play here and
+  // only advance the high-water mark once the samples really went out.
+  if (messageCount && page == PAGE_VOICE && voiceState == VOICE_READY && !rolling && !diceSoundActive) {
+    uint64_t cursor = prefs.getULong64("inbox-ts", 0);
+    uint64_t newest = (uint64_t)messages[0].ts * 1000ULL;
+    if (newest > cursor) {
+      safeLog("[voice] newer message than cursor, playing\n");
+      if (playMessage(0)) prefs.putULong64("inbox-ts", newest);
+    }
+  }
 }
 static bool playMessage(int idx) {
   if (!codecOk || idx < 0 || idx >= messageCount || WiFi.status() != WL_CONNECTED) return false;
@@ -599,40 +612,52 @@ static bool playMessage(int idx) {
     if (rate && !memcmp(header, "RIFF", 4) &&
         !memcmp(header + 8, "WAVE", 4) && !memcmp(header + 36, "data", 4) &&
         header[20] == 1 && header[22] == 1 && header[34] == 16 &&
-        (rate == SAMPLE_RATE || rate == 32000)) {
+        (rate == SAMPLE_RATE || rate == 32000 || rate == 44100 || rate == 48000)) {
       bool clockChanged = rate != SAMPLE_RATE;
       bool clockOk = !clockChanged ||
           (i2s_set_clk(I2S_NUM_1, rate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO) == ESP_OK &&
            es8311_sample_frequency_config(codec, rate * 256, rate) == ESP_OK);
-      if (clockOk) {
-      voiceState = VOICE_PLAYING; drawVoice();
-      digitalWrite(PA_PIN, HIGH);
-      uint32_t remaining; memcpy(&remaining, header + 40, 4);
-      int16_t mono[256], stereo[512]; ok = true;
-      touchPending = false;
-      while (remaining > 0 && (stream->connected() || stream->available())) {
-        size_t want = remaining < sizeof(mono) ? remaining : sizeof(mono);
-        size_t got = stream->readBytes((uint8_t *)mono, want);
-        if (!got) { ok = false; break; }
-        remaining -= got;
-        for (size_t i = 0; i < got / 2; i++) stereo[2 * i] = stereo[2 * i + 1] = mono[i];
-        size_t sent = 0;
-        if (i2s_write(I2S_NUM_1, stereo, got * 2, &sent, pdMS_TO_TICKS(1000)) != ESP_OK || sent != got * 2) {
-          ok = false; break;
-        }
-        playedBytes += got;
-        int16_t stopX, stopY;
-        if (touchPoint(stopX, stopY) && stopY < 65) break;
+      if (!clockOk) {
+        char r[80]; snprintf(r, sizeof(r), "[play] clock setup failed rate=%u\n", (unsigned)rate);
+        safeLog(r);
       }
-      if (remaining) ok = false;
-      vTaskDelay(pdMS_TO_TICKS(150));
-      i2s_zero_dma_buffer(I2S_NUM_1);
-      digitalWrite(PA_PIN, LOW);
+      if (clockOk) {
+        voiceState = VOICE_PLAYING; drawVoice();
+        digitalWrite(PA_PIN, HIGH);
+        uint32_t remaining; memcpy(&remaining, header + 40, 4);
+        int16_t mono[256], stereo[512]; ok = true;
+        touchPending = false;
+        while (remaining > 0 && (stream->connected() || stream->available())) {
+          size_t want = remaining < sizeof(mono) ? remaining : sizeof(mono);
+          size_t got = stream->readBytes((uint8_t *)mono, want);
+          if (!got) { ok = false; break; }
+          remaining -= got;
+          for (size_t i = 0; i < got / 2; i++) stereo[2 * i] = stereo[2 * i + 1] = mono[i];
+          size_t sent = 0;
+          if (i2s_write(I2S_NUM_1, stereo, got * 2, &sent, pdMS_TO_TICKS(1000)) != ESP_OK || sent != got * 2) {
+            ok = false; break;
+          }
+          playedBytes += got;
+          int16_t stopX, stopY;
+          if (touchPoint(stopX, stopY) && stopY < 65) break;
+        }
+        if (remaining) ok = false;
+        vTaskDelay(pdMS_TO_TICKS(150));
+        i2s_zero_dma_buffer(I2S_NUM_1);
+        digitalWrite(PA_PIN, LOW);
       }
       if (clockChanged) {
         i2s_set_clk(I2S_NUM_1, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
         es8311_sample_frequency_config(codec, SAMPLE_RATE * 256, SAMPLE_RATE);
       }
+    } else {
+      // Say exactly which header check rejected the file instead of returning
+      // false with no trace, which is what made "shows but stays silent" opaque.
+      char r[112]; snprintf(r, sizeof(r),
+        "[play] reject rate=%u riff=%d wave=%d data=%d fmt=%d ch=%d bits=%d\n",
+        (unsigned)rate, !memcmp(header, "RIFF", 4), !memcmp(header + 8, "WAVE", 4),
+        !memcmp(header + 36, "data", 4), header[20], header[22], header[34]);
+      safeLog(r);
     }
   }
   http.end(); voiceState = VOICE_READY; drawVoice();
@@ -684,7 +709,13 @@ static void pollIncoming() {
       wakeScreen(); page=PAGE_VOICE; voiceContactChosen=true;
       messages[0]=pending; messageCount=1;
       safeLog("[inbox] new family voice\n");
-      if(playMessage(0)) prefs.putULong64("inbox-ts",nextTs);
+      if(playMessage(0)) { prefs.putULong64("inbox-ts",nextTs); }
+      else {
+        // Leave the cursor behind so the next poll retries, but say why: a silent
+        // failure here looked identical to "the board never noticed".
+        char r[96]; snprintf(r,sizeof(r),"[inbox] play failed, will retry (codec=%d wifi=%d)\n",codecOk,WiFi.status()==WL_CONNECTED);
+        safeLog(r);
+      }
     }
   }
   cJSON_Delete(root);
