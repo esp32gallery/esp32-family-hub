@@ -16,7 +16,7 @@ The sketch requires Arduino_GFX, SensorLib's QMI8658 driver, and a CST92xx touch
 
 ## Renderer options
 
-At the top of `dice3d.ino`:
+At the top of `roll-dice.ino`:
 
 ```c
 #define DICE_USE_SDF 1   // SDF ray marching; higher image quality
@@ -30,7 +30,7 @@ These can be overridden with compiler definitions.
 No ESP32 board is required:
 
 ```sh
-c++ -O2 -std=c++17 -o /tmp/dice-host firmware/dice3d/host_test.cpp
+c++ -O2 -std=c++17 -o /tmp/dice-host apps/roll-dice/host_test.cpp
 /tmp/dice-host /tmp
 ```
 

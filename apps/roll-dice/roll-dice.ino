@@ -1,4 +1,16 @@
 /*
+ * ⚠️ DEPRECATED / 已停止维护 —— 这是历史快照，不是当前骰子实现。
+ *
+ * 刷新版请用 family-hub/family-hub.ino（SDF 直渲 480×480 + 预渲染翻滚序列）。
+ * 本文件保留的原因：
+ *   1. 配套 host_test.cpp，可在 Mac 上离线验证 dice_sdf.h 的正确性与耗时
+ *   2. 去掉语音/网络/音频依赖后的最小可读渲染示例
+ *
+ * 注意：本目录的 dice_sdf.h 也是旧版。做真实性能测试请替换为 family-hub/ 里的那份。
+ * 详见 ../README.md
+ */
+
+/*
  * 3D Dice — Waveshare ESP32-S3-Touch-AMOLED-2.16 (CO5300 480x480 + CST9220 + QMI8658)
  *
  * Software-only 3D:quaternion orientation → perspective projection → convex polygon scanline rasterization → 2× display scaling

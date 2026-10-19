@@ -1,123 +1,191 @@
-# 3D 骰子 · Waveshare ESP32-S3-Touch-AMOLED-2.16
+# Family Hub · 家庭小站
 
-纯软件 3D 渲染的骰子。**没有 GPU、不用 LVGL、不贴图** —— 四元数姿态 + 透视投影 + 凸多边形扫描线光栅化，全部跑在 ESP32-S3 的 CPU 上。
+一块 ESP32-S3 手表/相框，给还不会打字的家人用：**摇一摇掷骰子**，**按住说话留言**。
+家人用手机网页回一句，板子会自己亮起来、直接播放。
 
-## 目录
+A ESP32-S3 family device for people who can't type yet: **shake to roll a die**, **hold to leave a voice message**.
+When family replies from a phone, the device wakes up and plays it automatically.
+
+[中文](#中文) · [English](#english)
+
+---
+
+## 中文
+
+### 这是什么
+
+给小孩和长辈的语音留言板。不登录、不加好友、不弹广告——按一下就说，松手就发。
+
+- **摇骰子**：触摸、摇一摇、或按实体键，骰子抛起、翻面、落定
+- **说说话**：按住说话，松手发送，最长 15 秒
+- **收留言**：家人用手机网页回复，板子空闲时自动亮屏播放
+- **锁屏**：按 GPIO18 熄屏，新留言会唤醒并播放
+
+### 支持两块板
+
+| | 方板 Waveshare AMOLED-2.16 | 腕表 M5Stack StopWatch |
+|---|---|---|
+| 屏幕 | 480×480 方 | 466 圆（面板 480，offset 6） |
+| 触摸 | CST9220 | CST820B @0x15 |
+| 麦克风 | ES7210 + ES8311 | 仅 ES8311（ADC 直采） |
+| IMU | QMI8658 | BMI270 |
+| 电源管理 | XPowersLib | **M5PM1 @0x6E** |
+| IO 扩展 | 无 | **M5IOE1 @0x4F**（屏电源/复位/功放/震动） |
+| 震动 | 无 | 有（IOE PWM1 → GPIO9） |
+
+⚠️ 腕表上 LCD 电源、复位、触摸复位、codec 电源、功放使能**全走 M5IOE1**，方板那些直连管脚在腕表上不存在。不初始化 IOE，屏幕根本不亮。
+
+### 目录
 
 ```
-esp32-dice/
-├── dice3d/dice3d.ino     固件（单文件，可直接用 Arduino IDE 打开）
-├── preview/index.html    浏览器 1:1 效果预览（同一套数学，逐行移植）
-├── flash.sh              一键编译 + 烧录
-└── README.md
+├── family-hub/          ★ 默认固件 = 一个系统（首页：Roll Dice + Voice Notes + 设置）
+├── apps/                每个 App 单独跑的最小版本（隔离调试用，不要刷这里的）
+│   ├── roll-dice/       ⚠️ 已停止维护，仅保留离线渲染测试 + 最小示例
+│   └── voice-notes/     早期语音版
+├── server/              服务端：内网网页 + Telegram Bot
+└── preview/             浏览器 1:1 预览
 ```
 
-## 立刻看效果（板子还没到也能看）
+**设备上装的是一个系统，不是两个。** `Roll Dice` 和 `Voice Notes` 是它的两个 App，
+和手机上的 App 一个概念——它们不各自占一个仓库，也不各自占一次刷机。
+
+### 烧录
 
 ```bash
-cd preview && python3 -m http.server 8899
-# 打开 http://127.0.0.1:8899
+cd family-hub
+arduino-cli compile --fqbn 'esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,FlashSize=16M,USBMode=hwcdc,UploadSpeed=460800' .
+arduino-cli upload  --fqbn 'esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,FlashSize=16M,USBMode=hwcdc,UploadSpeed=460800' -p /dev/cu.usbmodem1101 .
 ```
 
-点击画面 / 按空格 / 按 Enter 掷骰。页面里跑的是和固件**完全相同**的渲染管线：
-同样的 240×240 内部缓冲、同样的 2× 放大、同样的 FOCAL/CAM_Z/光照/几何。
-唯一差别是浏览器用 JS（60 FPS），板子用 C++（预估 30~50 FPS）。
-
-## 烧录
+刷机前先整片备份（16MB，约 30 秒），这样随时能回到出厂固件：
 
 ```bash
-cd esp32-dice
-./flash.sh                 # 自动找串口
-./flash.sh /dev/cu.usbmodem1101   # 或手动指定
+esptool -p /dev/cu.usbmodem1101 read_flash 0x0 0x1000000 factory-backup.bin
 ```
 
-板子没被识别时：**按住 BOOT 键再插 USB 线，然后松开**。
+依赖：GFX Library for Arduino 1.6.6 / SensorLib 0.3.3 / U8g2 / WiFiManager / XPowersLib 0.2.6 / M5Unified（腕表用）
 
-编译参数（脚本里已固化）：
+### 串口调试命令
+
+| 键 | 作用 |
+|---|---|
+| `s` | 状态：触摸/IMU/音频/codec/WiFi/缓存/PSRAM/MAC |
+| `r` | 掷骰子 |
+| `v` | 进家人页面并拉列表 |
+| `p` | 重播最新留言 |
+| `h` | 回首页 |
+| `g` | 设置 |
+| `l` | 锁屏 |
+| `f` | 回读 RGB565 帧缓冲 |
+
+### 已修的坑
+
+- **停在家人页面时新留言只显示不播放**：列表由 `fetchMessages()` 每 15s 刷新，播放只由 `pollIncoming()` 负责，而后者在投骰/音效/录音时直接返回 → 刷进列表却不出声。现在 `fetchMessages()` 发现比水位线新的留言会直接播放，且只在播放成功后才推进水位线（commit `ebb2ee3`）。
+- **播放失败零日志**：`playMessage()` 原来只 `return false`，和"没收到"无法区分。现在会打印具体是哪项头部校验没过。
+- **CO5300 更新窗口必须偶数对齐**；单像素/1px 线在该屏不可靠，点数改用实心圆。
+- **`bus->writeC8D8(0x36, 0xA0)` 不能删**，库默认 MADCTL 和面板不匹配。
+- **功放使能是 GPIO46**，不拉高没声音。
+
+### 测试
+
+```bash
+# 板子停在家人页面，发一条留言，应在 ~3s 内自动播放
+curl -X POST 'http://<mac-ip>:8896/voice?from=dad' \
+  -H 'content-type: audio/wav' --data-binary @some.wav
 ```
-esp32:esp32:esp32s3
-  PSRAM=opi                    # 必须！板子是 OPI PSRAM
-  PartitionScheme=app3M_fat9M_16MB
-  CDCOnBoot=cdc                # USB CDC 串口
-  FlashSize=16M
-  USBMode=hwcdc
+
+服务端默认 `http://<mac-ip>:8896`（内网），手机录音走 `https://<mac-ip>:9443/`（需装本站局域网根证书）。
+
+---
+
+## English
+
+### What it is
+
+A voice mailbox for kids and grandparents. No login, no friend requests, no ads — press to talk, release to send.
+
+- **Roll dice** — tap, shake, or press the button; the die is tossed, flips, and lands
+- **Voice notes** — hold to record, release to send, up to 15 seconds
+- **Incoming messages** — family replies from a phone web page; the device wakes and plays it when idle
+- **Lock screen** — GPIO18 blanks the screen; a new message wakes it and plays
+
+### Two supported boards
+
+| | Waveshare AMOLED-2.16 | M5Stack StopWatch |
+|---|---|---|
+| Display | 480×480 square | 466 round (480 panel, offset 6) |
+| Touch | CST9220 | CST820B @0x15 |
+| Mic | ES7210 + ES8311 | ES8311 only (ADC direct) |
+| IMU | QMI8658 | BMI270 |
+| Power | XPowersLib | **M5PM1 @0x6E** |
+| IO expander | none | **M5IOE1 @0x4F** (LCD power/reset/PA/motor) |
+| Haptics | no | yes (IOE PWM1 → GPIO9) |
+
+⚠️ On the StopWatch, LCD power, reset, touch reset, codec power and PA enable all go through **M5IOE1**. The direct pins used on the square board do not exist there — without initializing the IOE the display never lights up.
+
+### Layout
+
+```
+├── family-hub/          ★ Default firmware = ONE system (home: Roll Dice + Voice Notes + Settings)
+├── apps/                Minimal single-app builds (for isolating a bug; do not flash these)
+│   ├── roll-dice/       ⚠️ deprecated — kept only for offline render test + minimal example
+│   └── voice-notes/     earlier voice-only build
+├── server/              Server: LAN web page + Telegram bot
+└── preview/             Pixel-accurate browser preview
 ```
 
-依赖库版本（已装好，**别升 LVGL v9**，虽然本工程不用 LVGL）：
-- GFX Library for Arduino 1.6.6
-- SensorLib 0.3.3
-- XPowersLib 0.2.6
+**The device runs one system, not two apps bolted together.** `Roll Dice` and `Voice Notes`
+are its two apps — same idea as apps on a phone. They don't get a repo each, and they don't
+need a separate flash each.
 
-## 已实现
+### Build & flash
 
-| 项 | 做法 |
+```bash
+cd family-hub
+arduino-cli compile --fqbn 'esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,FlashSize=16M,USBMode=hwcdc,UploadSpeed=460800' .
+arduino-cli upload  --fqbn 'esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,FlashSize=16M,USBMode=hwcdc,UploadSpeed=460800' -p /dev/cu.usbmodem1101 .
+```
+
+Always take a full-flash backup first (16MB, ~30s) so you can return to the stock firmware:
+
+```bash
+esptool -p /dev/cu.usbmodem1101 read_flash 0x0 0x1000000 factory-backup.bin
+```
+
+Dependencies: GFX Library for Arduino 1.6.6 / SensorLib 0.3.3 / U8g2 / WiFiManager / XPowersLib 0.2.6 / M5Unified (StopWatch).
+
+### Serial console
+
+| Key | Action |
 |---|---|
-| 3D 渲染 | 8 顶点 / 6 面，四元数旋转，透视投影（FOCAL=400, CAM_Z=4.7） |
-| 背面剔除 | `dot(法线, 面心) >= 0` 丢弃 |
-| 深度排序 | 画家算法（凸体够用，不需要 z-buffer） |
-| 光照 | 每面一个 Lambert 系数（0.38 + 0.62·N·L），光从左上前方来 |
-| 点数 | 面内 2D 坐标投影成**实心圆**，半径随透视缩放，并**裁剪到面内** |
-| 性能 | 内部 240×240 RGB565 渲染 → 2× 放大 → 脏矩形推屏 |
-| 掷骰 | 先定结果 → 780ms 自由翻滚（带抛起）→ 370ms slerp 缓动落位 |
-| 落位姿态 | 目标面朝相机 + 固定倾斜（露出顶面/侧面）+ ±0.15rad 面内自转 |
-| 触发 | 触摸（CST9220）/ 摇一摇（QMI8658）/ 板载 GPIO18 按键 |
-| 防烧屏 | 闲置 45s 降到亮度 55，3 分钟降到 12 |
-| 掉电保护 | 触摸/IMU 初始化失败只打日志、不卡死，骰子照常能玩 |
+| `s` | status: touch/IMU/audio/codec/WiFi/cache/PSRAM/MAC |
+| `r` | roll dice |
+| `v` | open family page and fetch list |
+| `p` | replay latest message |
+| `h` | home |
+| `g` | settings |
+| `l` | lock screen |
+| `f` | dump RGB565 framebuffer |
 
-## 为什么用「假物理」而不是真刚体
+### Problems already fixed
 
-真物理（角速度 + 面碰撞 + 摩擦停下）能跑，但调参极难，常出现「停在棱上」或「永不落地」。
-现在的做法是业界骰子 App 的通行方案：
+- **Messages showed up on the family page but never played.** The list was refreshed by `fetchMessages()` every 15s while playback lived only in `pollIncoming()`, which returns early during a roll, a sound effect, or a recording — so a message could enter the list and stay silent. `fetchMessages()` now plays anything newer than the high-water mark, and the mark only advances after playback succeeds (commit `ebb2ee3`).
+- **Silent playback failures.** `playMessage()` used to just `return false`, indistinguishable from "never received". It now logs exactly which header check failed.
+- **CO5300 window updates must be even-aligned**; single pixels and 1px lines are unreliable on this panel, so pips are filled circles.
+- **`bus->writeC8D8(0x36, 0xA0)` must stay** — the library's default MADCTL doesn't match the panel.
+- **PA enable is GPIO46**; no sound without raising it.
 
-1. `esp_random()` 先定结果 1..6
-2. 随机轴 + 随机角速度翻滚 780ms
-3. 最后 370ms 用四元数 slerp 缓动到「该点数朝相机」的固定姿态
+### Test
 
-好处：结果绝对可控（将来要做公平性校验/联机对赌也没问题）、姿态永远端正、代码量小一个数量级。
+```bash
+# Park the device on the family page, send a message,
+# it should auto-play within ~3s.
+curl -X POST 'http://<mac-ip>:8896/voice?from=dad' \
+  -H 'content-type: audio/wav' --data-binary @some.wav
+```
 
-## 这块板子的四个坑（都已在代码里避开）
+The server listens on `http://<mac-ip>:8896` (LAN). Phone recording uses `https://<mac-ip>:9443/` and needs the LAN root CA installed on the phone.
 
-1. **CO5300 更新窗口的起始坐标/宽/高必须全是偶数** —— `blitRect()` 里做了偶数对齐。
-2. **单像素和 1px 线在这块屏 + Arduino_GFX 组合下不可靠**（Arduino_GFX issue #780）—— 所以点数用实心圆，且半径至少 1px。
-3. **`bus->writeC8D8(0x36, 0xA0)` 这句 MADCTL 不能删**，库默认值和面板不匹配。
-4. **`Arduino_CO5300::setRotation()` 不转置像素**，90°/270° 得自己在应用层做。
+## License
 
-另外：**QMI8658 的 INT1 是 GPIO17，不是 GPIO13**（GPIO13 是 RTC 中断，某些资料写错过）。
-本工程不用 IMU 中断，直接轮询加速度，绕开这个坑。
-
-## 想调的东西在哪
-
-| 想改 | 位置 |
-|---|---|
-| 骰子大小 | `CAM_Z`（越大越小，4.7 约 320px） |
-| 透视强度 | `FOCAL`（越小越广角变形越强） |
-| 翻滚快慢 | `SPIN_MS` / `ROLL_MS` |
-| 骰子底色 | `BASE_R/G/B` |
-| 点数大小/间距 | `PIP_RAD` / `PIP_OFF` |
-| 立体倾斜角 | `TILT_X` / `TILT_Y` |
-| 摇一摇灵敏度 | `pollShake()` 里的 `dev > 0.55f` 和 `shakeScore > 4.0f` |
-| 分辨率/性能档 | `LOW_W`/`LOW_H`（160=更糊更快，320=更清晰更慢） |
-
-## 性能实测与预期
-
-浏览器实测（同一套光栅化逻辑）：
-- 每帧实际填充 **约 12700 像素**，只占 240×240 全屏的 **22%**（骰子只占屏幕一部分）
-- 每帧约 390 次 fillRow 调用
-
-带宽不是瓶颈：
-| 项目 | 数据 |
-|---|---|
-| 全屏一帧 RGB565 | 450 KB = 3.69 Mbit |
-| QSPI 40MHz 全屏理论 | 23 ms → 43 FPS |
-| QSPI 40MHz 推骰子区域(320²) | 10 ms → 98 FPS |
-
-所以瓶颈在 CPU 光栅化，不在 SPI。预计板上 **30~50 FPS**。
-若不够快，把 `LOW_W`/`LOW_H` 改成 160 可再翻一倍（视觉上是复古像素感）。
-
-## 下一步可以加
-
-- [ ] 骰子碰撞音效（ES8311 + I²S，注意 **功放使能是 GPIO46，不拉高没声音**）
-- [ ] 多颗骰子（2~5 颗，各自独立翻滚）
-- [ ] 掷骰历史 / 点数统计
-- [ ] 长按 GPIO18 切换「单颗/多颗」
-- [ ] 接小智语音（路线 B）：在小智固件里加 MCP tool `dice.roll`，让 LLM 解析「帮我掷个骰子」
+MIT

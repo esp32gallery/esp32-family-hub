@@ -36,7 +36,7 @@ node ~/bin/voice-inbox          # 端口 8896
 
 ## 板子固件
 
-`voice-fw.ino` —— 编译 1.03MB / 32% flash。
+`voice-notes.ino` —— 编译 1.03MB / 32% flash。
 
 改这三处：
 ```c
@@ -56,7 +56,7 @@ static const Contact CONTACTS[] = {
 
 编译烧录：
 ```bash
-cd ~/Desktop/esp32-dice/voice-fw
+cd ~/Desktop/esp32-dice/apps/voice-notes
 arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,FlashSize=16M,USBMode=hwcdc,UploadSpeed=460800" --upload -p /dev/cu.usbmodem2101 .
 ```
 
