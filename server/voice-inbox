@@ -2,7 +2,7 @@
 /**
  * 语音信箱 · 内网网页版 + 手机推送
  *
- * 板子：选联系人 → 按住录音 → 松手发送
+ * 板子：家庭会话 → 按住说话 → 松手发送
  * 手机：点推送通知直接打开那条语音；也可以开 http://<ip>:8896 看全部
  *
  * 推送通道（可插拔，配置在 ~/.config/voice-inbox/contacts.json）：
@@ -10,7 +10,7 @@
  *   ntfy    —— 跨平台，也要装 app
  *   webhook —— 自己接（POST JSON）
  *
- * ⚠️ 内网 HTTP 网页**不能**用 Web Push（iOS 强制 HTTPS+SW），所以推送必须走上面这些外部通道。
+ * 网页前台通过 SSE 接收来信；后台/锁屏提醒走 Telegram、Bark 等独立通知通道。
  */
 import http from "node:http";
 import crypto from "node:crypto";
@@ -278,10 +278,13 @@ const PAGE = `<!DOCTYPE html>
   header { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:6px; }
   h1 { font-size:19px; margin:0; letter-spacing:.02em; }
   .sub { font-size:12px; color:var(--dim); }
-  .tabs { display:flex; gap:8px; margin:12px 0 14px; overflow-x:auto; padding-bottom:2px; }
-  .tab { flex:0 0 auto; padding:6px 13px; border-radius:999px; border:1px solid var(--line);
-    background:var(--card); color:var(--dim); font-size:13px; cursor:pointer; }
-  .tab.on { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .receive { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0; }
+  .receive button,.receive a { font:inherit; font-size:14px; padding:10px 12px; border-radius:12px;
+    border:1px solid var(--line); background:var(--card); color:var(--accent); text-decoration:none; }
+  .receive button[aria-pressed="true"] { background:var(--accent); color:white; }
+  #newvoice { display:block; width:100%; border:0; border-radius:14px; padding:14px; margin:12px 0;
+    background:#e2f1e7; color:var(--accent); font:inherit; text-align:left; }
+  #newvoice[hidden] { display:none; }
   .item { background:var(--card); border:1px solid var(--line); border-radius:18px;
     padding:12px 14px; margin-bottom:12px; display:flex; align-items:center; gap:12px;
     width:fit-content; max-width:88%; min-width:min(280px,88%); }
@@ -338,6 +341,12 @@ const PAGE = `<!DOCTYPE html>
   </details>
 </div>
 
+<div class="receive">
+  <button id="autoplay" type="button" aria-pressed="false">开启自动播放</button>
+  <a href="https://t.me/family_voice_2026_bot" target="_blank" rel="noopener">后台提醒 ↗</a>
+</div>
+<p id="autohint" class="sub">网页开着时自动听；锁屏或离开网页，用 Telegram 提醒。</p>
+<button id="newvoice" type="button" hidden></button>
 <div id="list"></div>
 <button id="record" class="record" type="button" aria-label="按住说话，松开发送">🎙️</button>
 
@@ -374,18 +383,56 @@ function render() {
     </div>\`).join('');
 }
 
+let initialList = true, refreshing = false, refreshAgain = false;
+const seenVoices = new Set(), unreadVoices = new Set();
+let autoQueue = [], autoEnabled = false, autoCurrent = null, autoArming = false;
+const autoButton = document.getElementById('autoplay');
+const newVoiceButton = document.getElementById('newvoice');
+const autoHint = document.getElementById('autohint');
+function showUnread() {
+  newVoiceButton.hidden = unreadVoices.size === 0;
+  newVoiceButton.textContent = '宝宝发来 ' + unreadVoices.size + ' 条语音 · 点此收听';
+  document.title = unreadVoices.size ? '(' + unreadVoices.size + ') 宝宝来信' : '语音信箱';
+}
+function heard(id) { unreadVoices.delete(id); showUnread(); }
+function showAutoState() {
+  autoButton.setAttribute('aria-pressed', String(autoEnabled));
+  autoButton.textContent = autoEnabled ? '自动播放已开' : '开启自动播放';
+  autoHint.textContent = autoEnabled ? '宝宝的新语音会依次播放；说话时暂停，回到网页继续听。' : '网页开着时自动听；锁屏或离开网页，用 Telegram 提醒。';
+}
 async function refresh() {
+  if (refreshing) { refreshAgain = true; return; }
+  refreshing = true;
   try {
     const r = await fetch(BASE + '/api/list', { cache:'no-store' });
+    if (!r.ok) throw new Error('list unavailable');
     const j = await r.json();
     items = j.items; contacts = j.contacts || {};
+    for (const it of items.slice().reverse()) {
+      if (!initialList && !seenVoices.has(it.id) && it.direction === 'out') {
+        autoQueue.push(it.id); unreadVoices.add(it.id);
+      }
+      seenVoices.add(it.id);
+    }
+    initialList = false;
+    const live = new Set(items.map(it => it.id));
+    autoQueue = autoQueue.filter(id => live.has(id));
+    for (const id of unreadVoices) if (!live.has(id)) unreadVoices.delete(id);
     document.getElementById('dot').className = 'dot';
     document.getElementById('stat').textContent = items.length + ' 条';
-    render();
+    render(); showUnread();
+    if (playing) {
+      const button = document.querySelector('[data-play="'+playing+'"]');
+      if (button) { button.textContent = audio.paused ? '…' : '❚❚'; button.classList.add('playing'); }
+    }
     items.slice(0, 3).forEach(it => warmAudio(it.id));
+    drainAuto();
   } catch (e) {
     document.getElementById('dot').className = 'dot off';
     document.getElementById('stat').textContent = '离线';
+  } finally {
+    refreshing = false;
+    if (refreshAgain) { refreshAgain = false; queueMicrotask(refresh); }
   }
 }
 
@@ -404,9 +451,16 @@ const boundAudio = new WeakSet();
 function bindAudio(el) {
   if (boundAudio.has(el)) return;
   boundAudio.add(el);
-el.addEventListener('ended', stopPlay);
+el.addEventListener('ended', () => {
+  if (el !== audio) return;
+  if (el === autoAudio && autoCurrent) {
+    autoQueue = autoQueue.filter(id => id !== autoCurrent); autoCurrent = null;
+  }
+  stopPlay(); drainAuto();
+});
 el.addEventListener('playing', () => {
-  if (!playing) return;
+  if (el !== audio || !playing) return;
+  heard(playing);
   const b = document.querySelector('[data-play="'+playing+'"]');
   if (b) b.textContent='❚❚';
 });
@@ -415,7 +469,11 @@ el.addEventListener('timeupdate', () => {
   const bar = document.getElementById('bar-' + playing);
   if (bar && audio.duration) bar.style.width = (audio.currentTime/audio.duration*100) + '%';
 });
-  el.addEventListener('error', () => { if (el === audio) { stopPlay(); document.getElementById('stat').textContent='播放失败，请再试'; } });
+  el.addEventListener('error', () => {
+    if (el !== audio) return;
+    if (el === autoAudio) { autoCurrent=null; autoEnabled=false; showAutoState(); }
+    stopPlay(); document.getElementById('stat').textContent='播放失败，请再试';
+  });
 }
 bindAudio(audio);
 function stopPlay() {
@@ -428,11 +486,68 @@ function stopPlay() {
   playing = null;
 }
 
+// A single element is unlocked by a real tap and reused for all incoming clips.
+const autoAudio = new Audio(); autoAudio.preload = 'auto'; autoAudio.playsInline = true;
+bindAudio(autoAudio);
+function pauseForRecording() {
+  autoAudio.pause(); autoCurrent = null;
+  if (playing) { audio.pause(); stopPlay(); }
+}
+async function drainAuto() {
+  if (!autoEnabled || autoCurrent || playing || !autoQueue.length || document.hidden ||
+      pressHeld || sendingVoice || (recorder && recorder.state === 'recording')) return;
+  const id = autoQueue[0]; autoCurrent = id;
+  audio = autoAudio; audio.src = BASE + '/audio/' + id; playing = id;
+  const btn = document.querySelector('[data-play="'+id+'"]');
+  if (btn) { btn.textContent='…'; btn.classList.add('playing'); }
+  try { await audio.play(); }
+  catch (err) {
+    if (autoCurrent !== id) return;
+    autoCurrent=null; autoEnabled=false; stopPlay(); showAutoState();
+    autoHint.textContent='浏览器暂停了自动播放，请点开启或直接点语音收听。';
+  }
+}
+autoButton.addEventListener('click', async () => {
+  if (autoArming) return;
+  if (autoEnabled) {
+    autoEnabled=false;
+    if (audio === autoAudio) { autoAudio.pause(); autoCurrent=null; stopPlay(); }
+    showAutoState(); return;
+  }
+  autoArming=true; autoButton.disabled=true;
+  try {
+    const bytes = new ArrayBuffer(3244), view = new DataView(bytes);
+    const text = (at,s) => { for(let i=0;i<s.length;i++) view.setUint8(at+i,s.charCodeAt(i)); };
+    text(0,'RIFF'); view.setUint32(4,3236,true); text(8,'WAVEfmt ');
+    view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true);
+    view.setUint32(24,16000,true); view.setUint32(28,32000,true);
+    view.setUint16(32,2,true); view.setUint16(34,16,true); text(36,'data'); view.setUint32(40,3200,true);
+    const url=URL.createObjectURL(new Blob([bytes],{type:'audio/wav'}));
+    try { autoAudio.src=url; await autoAudio.play(); autoAudio.pause(); }
+    finally { URL.revokeObjectURL(url); }
+    autoEnabled=true; showAutoState();
+    autoHint.textContent='宝宝的新语音会依次播放；说话时暂停，回到网页继续听。';
+    drainAuto();
+  } catch (err) { autoHint.textContent='暂时无法开启，请直接点语音收听。'; }
+  finally { autoArming=false; autoButton.disabled=false; }
+});
+newVoiceButton.addEventListener('click', () => {
+  const id=autoQueue[0] || Array.from(unreadVoices)[0];
+  const btn=id && document.querySelector('[data-play="'+id+'"]');
+  if (btn) { btn.scrollIntoView({block:'center'}); btn.click(); }
+});
+
 document.addEventListener('click', async (e) => {
 
   const playId = e.target.dataset.play;
   if (playId) {
-    if (playing === playId) { audio.pause(); stopPlay(); return; }
+    if (playing === playId) {
+      audio.pause(); autoCurrent=null;
+      if (audio === autoAudio) { autoEnabled=false; showAutoState(); }
+      stopPlay(); return;
+    }
+    autoAudio.pause(); autoCurrent=null;
+    autoQueue=autoQueue.filter(id => id !== playId);
     audio.pause(); stopPlay(); playing = playId;
     const btn = document.querySelector('[data-play="'+playId+'"]');
     btn.textContent='…'; btn.classList.add('playing');
@@ -496,7 +611,7 @@ recordButton.addEventListener('pointerdown', async e => {
     recordStatus.textContent = '当前浏览器不支持录音，请用手机 Safari 或 Chrome 打开';
     return;
   }
-  pressHeld = true;
+  pressHeld = true; pauseForRecording();
   recordButton.setPointerCapture(e.pointerId);
   recordButton.classList.add('active');
   recordButton.textContent = '🔴';
@@ -507,7 +622,7 @@ recordButton.addEventListener('pointerdown', async e => {
       mic.getTracks().forEach(t => t.stop()); mic = null;
       recordButton.classList.remove('active'); recordButton.textContent = '🎙️';
       recordStatus.textContent = '麦克风已就绪，请再按住说话';
-      return;
+      drainAuto(); return;
     }
     chunks = [];
     recordSender = document.getElementById('sender').value;
@@ -519,7 +634,7 @@ recordButton.addEventListener('pointerdown', async e => {
       recordButton.textContent = '🎙️'; recordButton.classList.remove('active');
       const clip = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
       if (Date.now() - recordStarted < 400 || !clip.size) {
-        recordStatus.textContent = '说话时间太短，请按住再试'; return;
+        recordStatus.textContent = '说话时间太短，请按住再试'; drainAuto(); return;
       }
       sendingVoice = true; recordStatus.textContent = '正在发送给板子…';
       try {
@@ -529,7 +644,7 @@ recordButton.addEventListener('pointerdown', async e => {
         if (!res.ok) throw new Error(await res.text());
         recordStatus.textContent = '✓'; refresh();
       } catch (err) { recordStatus.textContent = '发送失败：' + err.message; }
-      sendingVoice = false;
+      sendingVoice = false; drainAuto();
     });
     recorder.start(); recordStarted = Date.now();
     recordButton.textContent = '🔴'; recordButton.classList.add('active');
@@ -543,7 +658,7 @@ recordButton.addEventListener('pointerdown', async e => {
     if (mic) mic.getTracks().forEach(t => t.stop());
     mic = null; pressHeld = false;
     recordButton.classList.remove('active'); recordButton.textContent = '🎙️';
-    recordStatus.textContent = '麦克风无法使用：' + err.message;
+    recordStatus.textContent = '麦克风无法使用：' + err.message; drainAuto();
   }
 });
 function releaseVoice(e) {
@@ -571,6 +686,16 @@ function jumpToHash() {
 refresh().then(() => setTimeout(jumpToHash, 300));
 window.addEventListener('hashchange', jumpToHash);
 setInterval(refresh, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (audio === autoAudio && autoCurrent) { autoAudio.pause(); autoCurrent=null; stopPlay(); }
+  } else { refresh(); drainAuto(); }
+});
+if (window.EventSource) {
+  const incoming = new EventSource(BASE + '/api/events');
+  incoming.addEventListener('voice', refresh);
+  incoming.addEventListener('open', refresh);
+}
 </script>
 </body>
 </html>`;
@@ -585,10 +710,28 @@ const MANIFEST = {
   }],
 };
 
+const eventClients = new Set();
+function announceVoice(id, direction) {
+  const event = 'event: voice\ndata: ' + JSON.stringify({id,direction}) + '\n\n';
+  for (const client of eventClients) {
+    if (client.destroyed || client.writableEnded || client.writableLength > 65536) { client.destroy(); eventClients.delete(client); }
+    else client.write(event);
+  }
+}
+
 // ---------------------------------------------------------------- HTTP
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
 
+  if (req.method === "GET" && url.pathname === "/api/events") {
+    res.writeHead(200, { "content-type":"text/event-stream", "cache-control":"no-cache, no-transform", "connection":"keep-alive", "x-accel-buffering":"no" });
+    res.flushHeaders(); res.write(': connected\n\n'); eventClients.add(res);
+    const heartbeat=setInterval(() => res.write(': keepalive\n\n'),25000);
+    heartbeat.unref();
+    res.on('close', () => { clearInterval(heartbeat); eventClients.delete(res); });
+    res.on('error', () => { eventClients.delete(res); res.destroy(); });
+    return;
+  }
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(PAGE.replace('__PUBLIC_URL__', PUBLIC_URL)); return;
@@ -766,6 +909,7 @@ const server = http.createServer(async (req, res) => {
       // Acknowledge local storage immediately; external delivery is durable and retried.
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, id, seconds: info.seconds, tg: incoming ? "none" : "queued" }));
+      announceVoice(id, incoming ? "in" : "out");
       if (!incoming) {
         queueTelegram(id);
         pushNotify(contact, info, id).catch(e => log(`推送失败：${safeTelegramError(e)}`));
@@ -796,7 +940,7 @@ http.createServer((req, res) => {
   let route = url.pathname.startsWith("/voice/") ? url.pathname.slice(6) : url.pathname;
   if (route === "/voice") route = "/voice";
   const key = url.searchParams.get("k") || "";
-  const valid = (s) => s.length === PUBLIC_KEY.length &&
+  const valid = (s) => Buffer.byteLength(s) === Buffer.byteLength(PUBLIC_KEY) &&
     crypto.timingSafeEqual(Buffer.from(s), Buffer.from(PUBLIC_KEY));
   if (key && valid(key) && req.method === "GET" && (route === "/" || route === "/index.html")) {
     res.writeHead(302, { "set-cookie": `voice_access=${PUBLIC_KEY}; Path=/voice/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax`, "location": "/voice/" });
@@ -807,7 +951,7 @@ http.createServer((req, res) => {
     res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
     res.end("请使用家人分享的语音链接打开"); return;
   }
-  const allowed = (req.method === "GET" && (route === "/" || route === "/index.html" || route === "/api/list" || route.startsWith("/audio/"))) ||
+  const allowed = (req.method === "GET" && (route === "/" || route === "/index.html" || route === "/api/list" || route === "/api/events" || route.startsWith("/audio/"))) ||
     (req.method === "POST" && (route === "/voice" || route === "/api/delete"));
   if (!allowed) { res.writeHead(404); res.end(); return; }
   const headers = { ...req.headers, host: `127.0.0.1:${PORT}` };
