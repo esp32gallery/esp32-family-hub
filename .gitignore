@@ -9,6 +9,7 @@ build/
 .vscode/
 .idea/
 .DS_Store
+private-config.h
 
 # 临时文件
 *.bak

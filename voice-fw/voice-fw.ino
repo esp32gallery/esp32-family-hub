@@ -20,13 +20,27 @@
 #include "HWCDC.h"
 #include "es7210.h"
 
+#if __has_include("private-config.h")
+#include "private-config.h"
+#endif
+
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
+#ifndef INBOX_BASE
+#define INBOX_BASE ""
+#endif
+#ifndef INBOX_SECRET
+#define INBOX_SECRET ""
+#endif
+
+
 // ---------------------------------------------------------------- 配置
 // WiFi：优先用 NVS 里保存的（配网过就用那个）；没有则尝试这里的默认值；
 // 都连不上 → 开热点 "VoiceMemo-Setup"，手机连上去配网。
-#define WIFI_SSID     "ASUS"
-#define WIFI_PASS     "123qweasd"
-#define INBOX_BASE    "http://192.168.31.114:8896"   // Air 的局域网 IP
-#define INBOX_SECRET  ""              // 与 VOICE_INBOX_SECRET 一致；不用就留空
 
 #define RECORD_MS     8000            // 最长录音
 #define SAMPLE_RATE   16000

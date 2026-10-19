@@ -27,7 +27,7 @@ for size in (32,40):
         glyphs[c]=im
     lines.append('};')
     lines.append(f'static_assert(sizeof(ZH_ALPHA_{size}) / sizeof(ZH_ALPHA_{size}[0]) == sizeof(ZH_CODES) / sizeof(ZH_CODES[0]), "Glyph table count mismatch");')
-    for text in ('家庭小站','按住说话','正在说话','点一下重听','亮度 音量 68%' ):
+    for text in ('Family Hub','Hold to talk','Recording','Tap to replay','Brightness Volume 68%' ):
         sample=Image.new('RGB',(480,64),'#fff4d8')
         for i,c in enumerate(text):
             if c in glyphs: sample.paste('#243028',(20+i*size,12),glyphs[c])

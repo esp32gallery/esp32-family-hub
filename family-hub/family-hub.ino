@@ -22,10 +22,24 @@ extern "C" {
 #include "roll_motion.h"
 #include "zh_font.h"
 
-#define WIFI_SSID "ASUS"
-#define WIFI_PASS "123qweasd"
-#define DEFAULT_SERVER "http://192.168.31.114:8896"
+#if __has_include("private-config.h")
+#include "private-config.h"
+#endif
+
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
+#ifndef DEFAULT_SERVER
+#define DEFAULT_SERVER ""
+#endif
+#ifndef INBOX_SECRET
 #define INBOX_SECRET ""
+#endif
+
+
 #define LCD_SDIO0 4
 #define LCD_SDIO1 5
 #define LCD_SDIO2 6
@@ -62,7 +76,7 @@ static const uint16_t C_RED = 0xFC51, C_OUT = 0x2B69;
 
 struct Contact { const char *key; const char *name; uint16_t color; };
 static const Contact CONTACTS[] = {
-  {"dad", "爸爸", C_GOLD}, {"mom", "妈妈", C_RED}, {"me", "我自己", C_TEAL}
+  {"dad", "Dad", C_GOLD}, {"mom", "Mom", C_RED}, {"me", "Me", C_TEAL}
 };
 struct Message { char id[48]; uint32_t ts; uint16_t seconds; bool incoming; uint8_t sender; };
 enum Page { PAGE_HOME, PAGE_DICE, PAGE_VOICE, PAGE_SETTINGS };
@@ -212,6 +226,15 @@ static void drawText(const char *s, int x, int y, uint16_t color, int scale = 1)
     cx += cp >= 32 && cp < 127 ? (scale == 1 ? ASCII_ADV_32[cp-32] : ASCII_ADV_40[cp-32]) : (scale == 1 ? 32 : 40);
   }
 }
+static void drawCenteredText(const char *s, int y, uint16_t color, int scale = 1) {
+  const char *p = s;
+  int width = 0;
+  while (*p) {
+    uint32_t cp = utf8Next(p);
+    width += cp >= 32 && cp < 127 ? (scale == 1 ? ASCII_ADV_32[cp - 32] : ASCII_ADV_40[cp - 32]) : (scale == 1 ? 32 : 40);
+  }
+  drawText(s, max(8, (SCR_W - width) / 2), y, color, scale);
+}
 static void line(int x, int y, int w, uint16_t color = C_LINE) {
   ui.fillRect(x, y, w, 1, color);
 }
@@ -228,20 +251,20 @@ static void drawBack(const char *title) {
 static void drawHome() {
   ui.fillScreen(C_BG);
   ui.fillRoundRect(28, 25, 424, 89, 24, C_CARD);
-  drawText("家庭小站", 54, 39, C_WHITE);
+  drawText("Family Hub", 54, 39, C_WHITE);
 
   pill(28, 136, 424, 132, 0xFE12, 0xFE12);
   ui.fillCircle(87, 202, 37, C_RED);
   ui.fillCircle(78, 194, 6, C_WHITE); ui.fillCircle(98, 212, 6, C_WHITE);
-  drawText("摇骰子", 158, 180, C_WHITE, 2);
+  drawText("Roll dice", 158, 180, C_WHITE, 2);
 
   pill(28, 286, 424, 132, 0xAF19, 0xAF19);
   ui.fillCircle(87, 352, 37, C_TEAL);
   ui.fillRoundRect(78, 334, 18, 28, 8, C_BG);
   ui.fillRect(86, 362, 3, 12, C_BG);
-  drawText("说说话", 158, 330, C_WHITE, 2);
+  drawText("Voice notes", 158, 330, C_WHITE, 2);
 
-  drawText("设置", 354, 442, C_MUTED);
+  drawText("Settings", 306, 442, C_MUTED);
   ui.flush();
 }
 static inline uint16_t avg565(uint16_t a, uint16_t b) {
@@ -259,7 +282,7 @@ static void drawDice() {
     memcpy(diceBig, diceFaces + (size_t)(diceValue - 1) * SCR_W * SCR_H,
            (size_t)SCR_W * SCR_H * sizeof(uint16_t));
     pill(16, 4, 112, 48, C_CARD);
-    drawText("返回", 38, 12, C_WHITE);
+    drawText("Back", 38, 12, C_WHITE);
     gfx->draw16bitRGBBitmap(0, 0, diceBig, SCR_W, SCR_H);
     const int *b = diceFaceBox[diceValue - 1];
     oldX0 = max(0, b[0] - 8); oldY0 = max(0, b[1] - 8);
@@ -278,7 +301,7 @@ static void drawDice() {
   uint32_t t2 = millis();
   if (!rolling) {
     pill(16, 4, 112, 48, C_CARD);
-    drawText("返回", 38, 12, C_WHITE);
+    drawText("Back", 38, 12, C_WHITE);
   }
   gfx->draw16bitRGBBitmap(0, 0, diceBig, SCR_W, SCR_H);
   uint32_t t3 = millis();
@@ -315,22 +338,22 @@ static void drawVoice() {
   ui.fillScreen(C_BG);
   if (voiceState == VOICE_RECORDING) {
     ui.fillScreen(C_RED);
-    drawText("正在说话", 160, 92, C_WHITE, 2);
+    drawCenteredText("Recording", 92, C_WHITE, 2);
     ui.fillCircle(240, 252, 60, C_WHITE);
     ui.fillRoundRect(230, 214, 20, 55, 10, C_RED);
     ui.fillRect(237, 270, 6, 22, C_RED);
-    drawText("0秒", 208, 336, C_WHITE);
-    drawText("松开发送", 176, 398, C_WHITE);
+    drawCenteredText("0 sec", 336, C_WHITE);
+    drawCenteredText("Release to send", 398, C_WHITE);
     ui.flush(); return;
   }
   int sender = messageCount ? messages[0].sender : 0;
-  drawBack("家人");
+  drawBack("Family");
   if (messageCount) {
     pill(24, 72, 432, 140, C_CARD, CONTACTS[sender].color);
     drawContactAvatar(72, 142, sender);
-    char duration[32]; snprintf(duration, sizeof(duration), "%s %u秒", CONTACTS[sender].name, messages[0].seconds);
+    char duration[32]; snprintf(duration, sizeof(duration), "%s %u sec", CONTACTS[sender].name, messages[0].seconds);
     drawText(duration, 138, 90, C_WHITE);
-    drawText(voiceState == VOICE_PLAYING ? "正在播放" : "点一下重听", 138, 154, C_MUTED);
+    drawText(voiceState == VOICE_PLAYING ? "Playing" : "Tap to replay", 138, 154, C_MUTED);
     ui.fillTriangle(396, 122, 396, 162, 426, 142, C_TEAL);
   }
   const int top = messageCount ? 228 : 80;
@@ -339,8 +362,8 @@ static void drawVoice() {
   ui.fillCircle(240, center, 50, C_WHITE);
   ui.fillRoundRect(230, center - 30, 20, 47, 10, C_TEAL);
   ui.fillRect(237, center + 14, 6, 19, C_TEAL);
-  drawText(voiceState == VOICE_SENDING ? "正在发送" : "按住说话",
-           160, top + height * 3 / 4, C_WHITE, 2);
+  drawCenteredText(voiceState == VOICE_SENDING ? "Sending" : "Hold to talk",
+                   top + height * 3 / 4, C_WHITE, 2);
   if (bannerUntil > millis() && banner[0]) {
     pill(76, 405, 328, 44, C_CARD);
     drawText(banner, 94, 414, C_WHITE);
@@ -355,7 +378,7 @@ static void drawVoiceResult(bool ok) {
     ui.fillTriangle(218, 301, 244, 326, 364, 178, C_WHITE);
     ui.fillTriangle(218, 301, 338, 152, 364, 178, C_WHITE);
   } else {
-    drawText("再试一次", 160, 216, C_WHITE, 2);
+    drawCenteredText("Try again", 216, C_WHITE, 2);
   }
   ui.flush();
 }
@@ -369,12 +392,12 @@ static void drawSlider(int y, const char *name, int value, uint16_t color) {
   ui.fillCircle(50 + width, y + 55, 14, C_WHITE);
 }
 static void drawSettings() {
-  ui.fillScreen(C_BG); drawBack("设置");
-  drawSlider(105, "亮度", brightness * 100 / 255, C_GOLD);
-  drawSlider(217, "音量", volume, C_TEAL);
+  ui.fillScreen(C_BG); drawBack("Settings");
+  drawSlider(105, "Brightness", brightness * 100 / 255, C_GOLD);
+  drawSlider(217, "Volume", volume, C_TEAL);
   pill(38, 340, 404, 60, C_CARD);
-  drawText("重新配网", 55, 357, C_WHITE); drawText(">", 412, 357, C_MUTED);
-  drawText(WiFi.status() == WL_CONNECTED ? "网络已连接" : "网络离线", 38, 420, C_MUTED);
+  drawText("Reconnect Wi-Fi", 55, 357, C_WHITE); drawText(">", 412, 357, C_MUTED);
+  drawText(WiFi.status() == WL_CONNECTED ? "Connected" : "Offline", 38, 420, C_MUTED);
 
   ui.flush();
 }
@@ -495,8 +518,8 @@ static size_t recordAudio() {
     if (now - start > MIN_REC_MS && now - lastFingerAt > 220) break;
     if (now - lastDraw > 250) {
       lastDraw = now;
-      char s[18]; snprintf(s, sizeof(s), "%u秒", (unsigned)((now - start) / 1000));
-      ui.fillRect(185, 339, 110, 38, C_RED); drawText(s, 216, 344, C_WHITE);
+      char s[18]; snprintf(s, sizeof(s), "%u sec", (unsigned)((now - start) / 1000));
+      ui.fillRect(170, 339, 140, 38, C_RED); drawCenteredText(s, 344, C_WHITE);
       ui.flush();
     }
   }
@@ -667,13 +690,13 @@ static void pollIncoming() {
   cJSON_Delete(root);
 }
 static void wifiPortal(bool force) {
-  ui.fillScreen(C_BG); drawBack("配网");
-  drawText("手机连接热点", 58, 140, C_WHITE);
+  ui.fillScreen(C_BG); drawBack("Wi-Fi setup");
+  drawText("Connect phone to", 58, 140, C_WHITE);
   drawText("FamilyHub-Setup", 58, 190, C_TEAL);
-  drawText("打开 192.168.4.1", 58, 245, C_MUTED);
+  drawText("Open 192.168.4.1", 58, 245, C_MUTED);
   ui.flush();
   WiFiManager wm; wm.setConfigPortalTimeout(180);
-  WiFiManagerParameter serverParam("srv", "服务器地址", serverBase, 110);
+  WiFiManagerParameter serverParam("srv", "Server URL", serverBase, 110);
   wm.addParameter(&serverParam);
   bool ok = force ? wm.startConfigPortal("FamilyHub-Setup") : wm.autoConnect("FamilyHub-Setup");
   if (ok) {
@@ -681,8 +704,8 @@ static void wifiPortal(bool force) {
     if (s && !strncmp(s, "http://", 7)) {
       strlcpy(serverBase, s, sizeof(serverBase)); prefs.putString("server", serverBase);
     }
-    notice("网络已连接");
-  } else notice("网络连接失败");
+    notice("Connected");
+  } else notice("Connection failed");
   redraw();
 }
 static void diceSoundTask(void *) {
@@ -796,7 +819,7 @@ static void handleTap(int x, int y) {
     if (x < 90 && y < 65) {
       setPage(PAGE_HOME);
     } else if (messageCount && y >= 72 && y < 212) {
-      if (messageCount && !playMessage(0)) notice("播放失败");
+      if (messageCount && !playMessage(0)) notice("Playback failed");
     } else if (y >= (messageCount ? 228 : 80)) {
       size_t n = recordAudio();
       bool sent = false;
