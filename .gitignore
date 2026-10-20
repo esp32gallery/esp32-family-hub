@@ -19,3 +19,8 @@ private-config.h
 # Reproducible simulator frames
 preview/frames/
 research/sources/
+
+# watch-hub 构建产物（PlatformIO）
+watch-hub/.pio/
+watch-hub/.pio-core
+watch-hub/.pio-venv
