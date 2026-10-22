@@ -8,7 +8,6 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <stdarg.h>
-#include <esp_task_wdt.h>
 #include <M5Unified.h>
 extern "C" {
 #include <cJSON.h>
@@ -27,6 +26,12 @@ extern "C" {
 #endif
 #ifndef WIFI_PASS
 #define WIFI_PASS ""
+#endif
+#ifndef WIFI_SSID2
+#define WIFI_SSID2 ""
+#endif
+#ifndef WIFI_PASS2
+#define WIFI_PASS2 ""
 #endif
 #ifndef DEFAULT_SERVER
 #define DEFAULT_SERVER ""
@@ -109,6 +114,14 @@ static bool joinDone = false;
 static bool loggedOnline = false;
 static uint32_t joinUntil = 0;
 
+struct WifiNet {
+  const char *ssid;
+  const char *pass;
+};
+static WifiNet wifiNets[2];
+static int wifiNetCount = 0;
+static int wifiNetAt = 0;
+
 static void logf(const char *fmt, ...) {
   char buf[180];
   va_list ap;
@@ -118,18 +131,13 @@ static void logf(const char *fmt, ...) {
   if (Serial.availableForWrite() >= (int)strlen(buf)) Serial.print(buf);
 }
 
-// loopTask is on the task watchdog (~5s). Our own waits feed it. Library
-// calls that can sit longer than that (HTTP upload/download) drop the task
-// off the watchdog for the duration of the call, then put it back.
-static void feedWdt() { esp_task_wdt_reset(); }
-
-struct WdtPause {
-  bool paused = false;
-  WdtPause() { paused = esp_task_wdt_delete(nullptr) == ESP_OK; }
-  ~WdtPause() {
-    if (paused && esp_task_wdt_add(nullptr) != ESP_OK) logf("[wdt] rearm failed\n");
-  }
-};
+// Arduino-ESP32 leaves loopTask off the task watchdog (loopTaskWDTEnabled
+// starts false). Only the idle tasks are subscribed. esp_task_wdt_delete on
+// this task logs "task not found" and changes nothing, so it is not called.
+// delay() blocks this task and lets the idle task run, which is what feeds
+// the watchdog. HTTPClient already does that internally; feedWdt() is the
+// same one-tick wait for our own record and playback loops.
+static void feedWdt() { delay(1); }
 
 static void noteActivity() { lastActivity = millis(); }
 
@@ -578,11 +586,7 @@ static bool uploadAudio(size_t count) {
     http.setTimeout(8000);
     http.addHeader("Content-Type", "audio/wav");
     if (*INBOX_SECRET) http.addHeader("X-Voice-Secret", INBOX_SECRET);
-    int status;
-    {
-      WdtPause pause;
-      status = http.POST(body, total);
-    }
+    int status = http.POST(body, total);
     ok = status == 200;
     logf("[upload] status=%d bytes=%u\n", status, (unsigned)total);
     http.end();
@@ -610,13 +614,9 @@ static void fetchMessages() {
   http.setReuse(false);
   http.setConnectTimeout(1500);
   http.setTimeout(2000);
-  int listStatus = -1;
+  int listStatus = http.GET();
   String body;
-  {
-    WdtPause pause;
-    listStatus = http.GET();
-    if (listStatus == 200 && http.getSize() < 65536) body = http.getString();
-  }
+  if (listStatus == 200 && http.getSize() < 65536) body = http.getString();
   if (listStatus == 200 && body.length()) {
     cJSON *root = cJSON_Parse(body.c_str());
     cJSON *items = root ? cJSON_GetObjectItem(root, "items") : nullptr;
@@ -662,22 +662,14 @@ static bool playMessage(int idx) {
   http.setTimeout(6000);
   bool ok = false;
   size_t played = 0;
-  int audioStatus;
-  {
-    WdtPause pause;
-    audioStatus = http.GET();
-  }
+  int audioStatus = http.GET();
   if (audioStatus == 200) {
     int len = http.getSize();
     if (len > 44 && len <= 2 * 1024 * 1024) {
       uint8_t *buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
       if (buf) {
         WiFiClient *stream = http.getStreamPtr();
-        size_t got;
-        {
-          WdtPause pause;
-          got = stream->readBytes(buf, len);
-        }
+        size_t got = stream->readBytes(buf, len);
         if (got == (size_t)len && !memcmp(buf, "RIFF", 4) && !memcmp(buf + 8, "WAVE", 4)) {
           uint32_t rate = 0;
           uint16_t ch = 0, bits = 0;
@@ -734,13 +726,9 @@ static void pollIncoming() {
   http.setReuse(true);
   http.setConnectTimeout(800);
   http.setTimeout(1200);
-  int pollStatus = -1;
+  int pollStatus = http.GET();
   String body;
-  {
-    WdtPause pause;
-    pollStatus = http.GET();
-    if (pollStatus == 200) body = http.getString();
-  }
+  if (pollStatus == 200) body = http.getString();
   http.end();
   if (pollStatus != 200) return;
   cJSON *root = cJSON_Parse(body.c_str());
@@ -794,13 +782,9 @@ static void seedInboxOnce() {
   snprintf(url, sizeof(url), "%s/api/list?direction=in&limit=1", serverBase);
   if (!http.begin(client, url)) return;
   http.setTimeout(1500);
-  int seedStatus = -1;
+  int seedStatus = http.GET();
   String body;
-  {
-    WdtPause pause;
-    seedStatus = http.GET();
-    if (seedStatus == 200) body = http.getString();
-  }
+  if (seedStatus == 200) body = http.getString();
   if (seedStatus == 200) {
     cJSON *root = cJSON_Parse(body.c_str());
     cJSON *items = root ? cJSON_GetObjectItem(root, "items") : nullptr;
@@ -843,10 +827,23 @@ static void closePortal() {
     prefs.putString("server", serverBase);
   }
   WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
   loggedOnline = false;
   joinDone = true;
   logf("[wifi] portal closed status=%d\n", (int)WiFi.status());
   if (!screenLocked) redraw();
+}
+
+static void beginWifiNet(int index) {
+  wifiNetAt = index;
+  if (index < wifiNetCount) {
+    logf("[wifi] try %s\n", wifiNets[index].ssid);
+    WiFi.begin(wifiNets[index].ssid, wifiNets[index].pass);
+  } else {
+    logf("[wifi] try saved\n");
+    WiFi.begin();
+  }
+  joinUntil = millis() + 12000;
 }
 
 static void serviceWifi() {
@@ -856,16 +853,24 @@ static void serviceWifi() {
     return;
   }
   if (!joinDone) {
-    if (WiFi.status() == WL_CONNECTED) joinDone = true;
-    else if ((int32_t)(millis() - joinUntil) >= 0) {
+    if (WiFi.status() == WL_CONNECTED) {
       joinDone = true;
-      logf("[wifi] offline\n");
+      WiFi.setAutoReconnect(true);
+    } else if ((int32_t)(millis() - joinUntil) >= 0) {
+      int next = wifiNetAt + 1;
+      if (next < wifiNetCount) {
+        WiFi.disconnect(false, false, 0);
+        beginWifiNet(next);
+      } else {
+        joinDone = true;
+        logf("[wifi] offline\n");
+      }
     }
   }
   if (WiFi.status() == WL_CONNECTED && !loggedOnline) {
     loggedOnline = true;
     WiFi.setSleep(false);
-    logf("[wifi] %s\n", WiFi.localIP().toString().c_str());
+    logf("[wifi] %s %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     seedInboxOnce();
   } else if (WiFi.status() != WL_CONNECTED) {
     loggedOnline = false;
@@ -1098,13 +1103,15 @@ void setup() {
   drawHome();
   noteActivity();
 
+  if (WIFI_SSID[0]) wifiNets[wifiNetCount++] = {WIFI_SSID, WIFI_PASS};
+  if (WIFI_SSID2[0]) wifiNets[wifiNetCount++] = {WIFI_SSID2, WIFI_PASS2};
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
+  // Stay off until one candidate associates. Otherwise a failed first
+  // network is retried in the background and crowds out WIFI_SSID2.
+  WiFi.setAutoReconnect(false);
   WiFi.persistent(true);
-  if (WIFI_SSID[0]) WiFi.begin(WIFI_SSID, WIFI_PASS);
-  else WiFi.begin();
-  joinUntil = millis() + 12000;
+  beginWifiNet(wifiNetCount ? 0 : 1);
   logf("[hub] ready\n");
 }
 

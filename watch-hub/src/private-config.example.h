@@ -4,6 +4,9 @@
 
 #define WIFI_SSID "your-ssid"
 #define WIFI_PASS "your-pass"
+// Tried only when the first network does not associate. Leave empty to skip.
+#define WIFI_SSID2 ""
+#define WIFI_PASS2 ""
 #define DEFAULT_SERVER "http://192.168.1.10:8896"
 #define INBOX_SECRET ""
 
