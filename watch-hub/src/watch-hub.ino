@@ -84,7 +84,12 @@ static Page page = PAGE_HOME, settingsReturn = PAGE_HOME;
 static VoiceState voiceState = VOICE_READY;
 static char serverBase[112] = DEFAULT_SERVER;
 static char banner[64] = "";
-static uint32_t bannerUntil = 0, lastTouchAt = 0, lastListAt = 0, lastActivity = 0;
+static uint32_t bannerUntil = 0, lastListAt = 0, lastActivity = 0;
+// One gesture, one action. Cleared after two polls with the finger up so a
+// single dropped CST820 read in the middle of a press does not fire again.
+static bool tapGesture = false;
+static uint8_t tapUpStreak = 0;
+static bool prefsDirty = false;
 static uint8_t brightness = 160, volume = 70;
 static int messageCount = 0;
 static bool voiceContactChosen = false;
@@ -452,7 +457,13 @@ static void redraw() {
   }
 }
 
+static void savePrefs();
+
 static void setPage(Page p) {
+  if (prefsDirty) {
+    prefsDirty = false;
+    savePrefs();
+  }
   if (page == PAGE_DICE && p != PAGE_DICE) {
     diceSoundCancel = true;
     rolling = false;
@@ -963,24 +974,44 @@ static int sliderFromX(int x, int full) {
   return constrain((x - (SL_X + 8)) * full / w, 0, full);
 }
 
-static void handleTap(int x, int y) {
-  if (millis() - lastTouchAt < 260) return;
-  lastTouchAt = millis();
+// Header card occupies y=56..120. Home targets are the full horizontal
+// strips (any x on the glass), split on the gaps between the cards.
+static const int HOME_ROW_DICE = 112;    // through the dice card (148..252)
+static const int HOME_ROW_VOICE = 258;   // through the voice card (264..368)
+static const int HOME_ROW_SET = 378;     // settings card starts at 388
+
+static bool onGlass(int x, int y) {
+  const int dx = x - SCR_W / 2;
+  const int dy = y - SCR_H / 2;
+  const int r = SCR_W / 2;
+  return (int32_t)dx * dx + (int32_t)dy * dy <= (int32_t)r * r;
+}
+
+// Back pill is (118, 28, 112x44). Keep this off the die: at rest the die's
+// top is near y=98, and the chip's wake-up sample lands near (23, 27).
+static bool backHit(int x, int y) {
+  return y < 84 && x >= 96 && x < 252;
+}
+
+static void handleTap(int x, int y, bool first) {
   noteActivity();
-  logf("[tap] x=%d y=%d page=%d\n", x, y, (int)page);
+  if (first) logf("[tap] x=%d y=%d page=%d\n", x, y, (int)page);
   if (page == PAGE_HOME) {
-    if (y >= HOME_DICE_Y && y < HOME_DICE_Y + HOME_DICE_H) setPage(PAGE_DICE);
-    else if (y >= HOME_VOICE_Y && y < HOME_VOICE_Y + HOME_VOICE_H) {
+    if (!first) return;
+    if (y >= HOME_ROW_DICE && y < HOME_ROW_VOICE) setPage(PAGE_DICE);
+    else if (y >= HOME_ROW_VOICE && y < HOME_ROW_SET) {
       setPage(PAGE_VOICE);
       fetchMessages();
-    } else if (y >= HOME_SET_Y) {
+    } else if (y >= HOME_ROW_SET) {
       settingsReturn = PAGE_HOME;
       setPage(PAGE_SETTINGS);
     }
   } else if (page == PAGE_DICE) {
-    if (x < 250 && y < 90) setPage(PAGE_HOME);
+    if (!first) return;
+    if (backHit(x, y)) setPage(PAGE_HOME);
     else rollDice();
   } else if (page == PAGE_VOICE) {
+    if (!first) return;
     const int holdTop = messageCount ? 230 : 120;
     if (x < 250 && y < 100) setPage(PAGE_HOME);
     else if (messageCount && y >= 112 && y < 212) {
@@ -1001,19 +1032,50 @@ static void handleTap(int x, int y) {
       drawVoice();
     }
   } else if (page == PAGE_SETTINGS) {
-    if (x < 250 && y < 100) setPage(settingsReturn);
+    if (first && backHit(x, y)) setPage(settingsReturn);
     else if (y >= 150 && y <= 196) {
-      brightness = (uint8_t)constrain(sliderFromX(x, 255), 12, 255);
-      board::setBrightness(brightness);
-      savePrefs();
-      drawSettings();
+      uint8_t next = (uint8_t)constrain(sliderFromX(x, 255), 12, 255);
+      if (next != brightness) {
+        brightness = next;
+        board::setBrightness(brightness);
+        prefsDirty = true;
+        drawSettings();
+      }
     } else if (y >= 248 && y <= 294) {
-      volume = (uint8_t)sliderFromX(x, 100);
-      board::setVolumePercent(volume);
-      savePrefs();
-      drawSettings();
-    } else if (y >= 328 && y <= 384) startPortal();
+      uint8_t next = (uint8_t)sliderFromX(x, 100);
+      if (next != volume) {
+        volume = next;
+        board::setVolumePercent(volume);
+        prefsDirty = true;
+        drawSettings();
+      }
+    } else if (first && y >= 328 && y <= 384) startPortal();
   }
+}
+
+// Fire on the first on-glass sample of a contact. The CST820's first report
+// after sleep is often the raw origin, which the affine maps to about
+// (23, 27) — off the glass, and inside the old dice "back" box. Accepting
+// that sample used to arm a 260ms ignore window, so the real point of a
+// short tap was thrown away and only a hold past that window registered.
+static void serviceTouch() {
+  int16_t x = 0, y = 0;
+  if (!board::readTouch(x, y)) {
+    if (tapUpStreak < 2) ++tapUpStreak;
+    if (tapUpStreak >= 2) {
+      tapGesture = false;
+      if (prefsDirty) {
+        prefsDirty = false;
+        savePrefs();
+      }
+    }
+    return;
+  }
+  tapUpStreak = 0;
+  if (!onGlass(x, y)) return;
+  const bool first = !tapGesture;
+  tapGesture = true;
+  handleTap(x, y, first);
 }
 
 static void serviceSerial() {
@@ -1159,7 +1221,7 @@ void loop() {
   serviceSerial();
 
   int16_t x = 0, y = 0;
-  if (board::readTouch(x, y)) handleTap(x, y);
+  serviceTouch();
   if (portalRunning) {
     delay(10);
     return;
@@ -1203,5 +1265,8 @@ void loop() {
       millis() - lastActivity > kIdleSleepMs) {
     lockScreen("idle");
   }
-  delay(rolling ? 1 : 8);
+  // Touch_CST816S::getTouchRaw returns "no finger" without reading the chip
+  // when called again inside 10ms, unless the 2ms INT pulse is low. The roll
+  // frame itself takes longer than that; this floor covers the idle loop.
+  delay(10);
 }

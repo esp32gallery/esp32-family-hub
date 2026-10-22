@@ -61,10 +61,20 @@ void applyTouchAffine() {
     affine[5] = (kHeight - 1) - affine[5];
   }
   panel->setCalibrateAffine(affine);
+  // The CST820 shares I2C port 1 with the PMIC and IO expander, which run at
+  // 100kHz. M5GFX's StopWatch config asks the touch chip for 400kHz. A failed
+  // read is reported as "not touching", so a 50–120ms tap often ends before
+  // any transaction ACKs; a longer press eventually lands one.
+  lgfx::ITouch *tp = panel->touch();
+  if (tp) {
+    auto tcfg = tp->config();
+    tcfg.freq = kI2cHz;
+    tp->config(tcfg);
+  }
   gTouch = M5.Touch.isEnabled();
-  Serial.printf("[touch] affine x=%.4f*raw%+.1f y=%.4f*raw%+.1f mirror=%d%d en=%d\n",
+  Serial.printf("[touch] affine x=%.4f*raw%+.1f y=%.4f*raw%+.1f mirror=%d%d en=%d i2c=%luHz\n",
                 affine[0], affine[2], affine[4], affine[5], TOUCH_MIRROR_X, TOUCH_MIRROR_Y,
-                (int)gTouch);
+                (int)gTouch, (unsigned long)kI2cHz);
 }
 
 void maskRound(uint16_t *fb) {
