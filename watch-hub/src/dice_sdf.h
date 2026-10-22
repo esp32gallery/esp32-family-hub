@@ -13,6 +13,9 @@
 //
 //  能在 Mac 上单独编译（见 host_test.cpp），这样每次改渲染都能先离线验证
 //  正确性和耗时，再烧板子。
+//
+//  设备热路径用 renderFast()（凸四边形填充 + 点数椭圆）。SDF render() 留着
+//  做对拍，禁止在 466 画布的主循环里调用：实测首帧约 4s，会撑爆看门狗。
 // ============================================================================
 #pragma once
 #include <stdint.h>
@@ -382,6 +385,158 @@ public:
         buf[(size_t)y * W + x] = rgb565(r, g, b2);
       }
     }
+  }
+
+  // 投影约定与 render() 相同：物体空间顶点先旋转，相机平移只进 z
+  // （wz = v.z + camZ），垂直偏移只加在屏幕 y（v.y + yOff）。不要把 camZ
+  // 再加进旋转前的坐标，否则骰子会缩成大约 1/6。
+  // p.focal 以 480 画布为基准，内部按 W/480 缩放。466 上 focal=1600、
+  // camZ=4.2 时骰子直径约 0.8*W，单帧大约十几毫秒。
+  void renderFast(Quat q, float yOff) {
+    if (!buf || W < 8 || H < 8) return;
+    memset(buf, 0, (size_t)W * (size_t)H * sizeof(uint16_t));
+    bboxX0 = W; bboxY0 = H; bboxX1 = 0; bboxY1 = 0;
+
+    const float focal = p.focal * (W / 480.0f);
+    const float halfW = W * 0.5f;
+    const float halfH = H * 0.5f;
+    const float cz = p.camZ;
+    const float hh = p.H;
+
+    struct S { int x, y; bool ok; };
+    S corner[8];
+    for (int i = 0; i < 8; ++i) {
+      V3 o = v3((i & 1) ? hh : -hh, (i & 2) ? hh : -hh, (i & 4) ? hh : -hh);
+      V3 v = qrot(o, q);
+      float wz = v.z + cz;
+      if (wz < 0.25f) { corner[i].ok = false; continue; }
+      corner[i].ok = true;
+      corner[i].x = (int)floorf(halfW + focal * v.x / wz + 0.5f);
+      corner[i].y = (int)floorf(halfH - focal * (v.y + yOff) / wz + 0.5f);
+    }
+
+    V3 light = vnorm(v3(p.lx, p.ly, p.lz));
+    // bit0=x bit1=y bit2=z，与上面的 8 角编号一致
+    static const uint8_t QUAD[6][4] = {
+      {4, 5, 7, 6}, // +Z
+      {0, 2, 3, 1}, // -Z
+      {1, 3, 7, 5}, // +X
+      {0, 4, 6, 2}, // -X
+      {2, 6, 7, 3}, // +Y
+      {0, 1, 5, 4}, // -Y
+    };
+
+    for (int fi = 0; fi < 6; ++fi) {
+      V3 nW = qrot(FACES[fi].n, q);
+      if (nW.z > 0.0f) continue;
+
+      int xs[4], ys[4];
+      bool vis = true;
+      for (int k = 0; k < 4; ++k) {
+        const S &c = corner[QUAD[fi][k]];
+        if (!c.ok) { vis = false; break; }
+        xs[k] = c.x;
+        ys[k] = c.y;
+      }
+      if (!vis) continue;
+
+      float lam = vdot(nW, light);
+      if (lam < 0.0f) lam = 0.0f;
+      float hemi = 0.5f + 0.5f * nW.y;
+      float shade = 0.42f + 0.22f * hemi + 0.36f * lam;
+      if (shade > 1.05f) shade = 1.05f;
+      const uint16_t body = rgb565((int)(p.bodyR * shade), (int)(p.bodyG * shade), (int)(p.bodyB * shade));
+      float pshade = 0.74f + 0.26f * lam;
+      const uint16_t pip = rgb565((int)(p.pipR * pshade), (int)(p.pipG * pshade), (int)(p.pipB * pshade));
+      const uint16_t pipRim = rgb565((int)(p.pipR * pshade * 0.78f),
+                                     (int)(p.pipG * pshade * 0.78f),
+                                     (int)(p.pipB * pshade * 0.78f));
+
+      int miny = ys[0], maxy = ys[0];
+      for (int k = 1; k < 4; ++k) {
+        if (ys[k] < miny) miny = ys[k];
+        if (ys[k] > maxy) maxy = ys[k];
+      }
+      if (miny < 0) miny = 0;
+      if (maxy > H - 1) maxy = H - 1;
+
+      for (int y = miny; y <= maxy; ++y) {
+        int xL = 1000000, xR = -1000000;
+        for (int e = 0; e < 4; ++e) {
+          int yA = ys[e], yB = ys[(e + 1) & 3];
+          int xA = xs[e], xB = xs[(e + 1) & 3];
+          if (yA == yB) continue;
+          int lo = yA < yB ? yA : yB;
+          int hi = yA < yB ? yB : yA;
+          if (y < lo || y > hi) continue;
+          int x = xA + (int)(((int64_t)(xB - xA) * (y - yA)) / (yB - yA));
+          if (x < xL) xL = x;
+          if (x > xR) xR = x;
+        }
+        if (xL > xR) continue;
+        if (xL > 0) xL -= 1;
+        if (xR < W - 1) xR += 1;
+        if (xL < 0) xL = 0;
+        if (xR > W - 1) xR = W - 1;
+        uint16_t *row = buf + (size_t)y * W;
+        for (int x = xL; x <= xR; ++x) row[x] = body;
+        if (xL < bboxX0) bboxX0 = xL;
+        if (xR > bboxX1) bboxX1 = xR;
+        if (y < bboxY0) bboxY0 = y;
+        if (y > bboxY1) bboxY1 = y;
+      }
+
+      const FaceAxis &fa = FACES[fi];
+      const int val = fa.val;
+      for (int pi = 0; pi < val; ++pi) {
+        float pu = PIP_XY[val][pi][0];
+        float pv = PIP_XY[val][pi][1];
+        V3 c3 = vadd(vmul(fa.n, hh), vadd(vmul(fa.r, pu), vmul(fa.u, pv)));
+        V3 a3 = vadd(c3, vmul(fa.r, p.pipRad));
+        V3 b3 = vadd(c3, vmul(fa.u, p.pipRad));
+        int cx, cy, ax, ay, bx, by;
+        if (!projectPoint(q, c3, yOff, focal, halfW, halfH, cz, cx, cy)) continue;
+        if (!projectPoint(q, a3, yOff, focal, halfW, halfH, cz, ax, ay)) continue;
+        if (!projectPoint(q, b3, yOff, focal, halfW, halfH, cz, bx, by)) continue;
+        ax -= cx; ay -= cy; bx -= cx; by -= cy;
+        float det = (float)ax * by - (float)ay * bx;
+        if (det > -0.5f && det < 0.5f) continue;
+        float inv = 1.0f / det;
+        int rad = (int)ceilf(sqrtf((float)(ax * ax + ay * ay)) + sqrtf((float)(bx * bx + by * by))) + 2;
+        int xa = cx - rad, xb = cx + rad, ya = cy - rad, yb = cy + rad;
+        if (xa < 0) xa = 0;
+        if (ya < 0) ya = 0;
+        if (xb > W - 1) xb = W - 1;
+        if (yb > H - 1) yb = H - 1;
+        for (int y = ya; y <= yb; ++y) {
+          uint16_t *row = buf + (size_t)y * W;
+          for (int x = xa; x <= xb; ++x) {
+            float px = (x + 0.5f) - cx;
+            float py = (y + 0.5f) - cy;
+            float s = (px * by - py * bx) * inv;
+            float t = ((float)ax * py - (float)ay * px) * inv;
+            float e2 = s * s + t * t;
+            if (e2 > 1.0f) continue;
+            row[x] = e2 > 0.84f ? pipRim : pip;
+          }
+        }
+      }
+    }
+
+    if (bboxX0 > bboxX1 || bboxY0 > bboxY1) {
+      bboxX0 = bboxY0 = bboxX1 = bboxY1 = 0;
+    }
+  }
+
+private:
+  static bool projectPoint(Quat q, V3 obj, float yOff, float focal,
+                           float halfW, float halfH, float cz, int &sx, int &sy) {
+    V3 v = qrot(obj, q);
+    float wz = v.z + cz;
+    if (wz < 0.25f) return false;
+    sx = (int)floorf(halfW + focal * v.x / wz + 0.5f);
+    sy = (int)floorf(halfH - focal * (v.y + yOff) / wz + 0.5f);
+    return true;
   }
 
 private:
