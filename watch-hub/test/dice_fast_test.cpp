@@ -1,4 +1,5 @@
 #include "dice_sdf.h"
+#include "roll_motion.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,34 +47,40 @@ int main() {
   if (!full) return 2;
   r.W = r.H = big;
   r.buf = full;
+  // Same focal the firmware uses. Corners must stay inside the round mask
+  // at rest and at the toss peak (liftAt max is 78px, mapped with camZ/focal).
+  r.p.focal = 660.0f;
+  const float focalPx = 660.0f * (big / 480.0f);
   struct timespec a, b;
   clock_gettime(CLOCK_MONOTONIC, &a);
-  r.renderFast(dice::targetForValue(5, 0.1f), 0.2f);
+  r.renderFast(dice::targetForValue(5, 0.1f), 0);
   clock_gettime(CLOCK_MONOTONIC, &b);
   double ms = (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1e6;
   int red = 0, white = 0;
   int filled = count_colors(full, big * big, &red, &white);
-  int minx = big, miny = big, maxx = 0, maxy = 0;
-  for (int y = 0; y < big; ++y) {
-    for (int x = 0; x < big; ++x) {
-      if (!full[y * big + x]) continue;
-      if (x < minx) minx = x;
-      if (y < miny) miny = y;
-      if (x > maxx) maxx = x;
-      if (y > maxy) maxy = y;
-    }
-  }
-  printf("466 filled=%d red=%d white=%d ms=%.2f tight=%d,%d-%d,%d\n", filled, red, white, ms,
-         minx, miny, maxx, maxy);
+  printf("466 filled=%d red=%d white=%d ms=%.2f\n", filled, red, white, ms);
 
   int outside = 0;
   const int cx = big / 2, rad = big / 2 - 2, r2 = rad * rad;
-  for (int y = 0; y < big; ++y) {
-    for (int x = 0; x < big; ++x) {
-      int dx = x - cx, dy = y - cx;
-      if (dx * dx + dy * dy > r2 && full[y * big + x]) ++outside;
+  auto countOutside = [&]() {
+    int n = 0;
+    for (int y = 0; y < big; ++y) {
+      for (int x = 0; x < big; ++x) {
+        int dx = x - cx, dy = y - cx;
+        if (dx * dx + dy * dy > r2 && full[(size_t)y * big + x]) ++n;
+      }
     }
+    return n;
+  };
+  outside += countOutside();
+  float peakY = 78.0f * 4.2f / focalPx;
+  for (int f = 0; f < rollmotion::COUNT; ++f) {
+    r.renderFast(rollmotion::pose(f), 0);
+    outside += countOutside();
+    r.renderFast(rollmotion::pose(f), peakY);
+    outside += countOutside();
   }
+  printf("outside-circle=%d\n", outside);
   const int S = 120;
   uint16_t *small = (uint16_t *)calloc((size_t)S * S, sizeof(uint16_t));
   r.W = r.H = S;
@@ -110,6 +117,6 @@ int main() {
   printf("outside-circle=%d faces=%d\n", outside, facesWithPips);
   // Host is much faster than the ESP32. A multi-second frame means the SDF
   // path leaked back in. A few hundred milliseconds is still fine here.
-  if (facesWithPips < 6 || red < 1000 || white < 20 || ms > 800.0) return 1;
+  if (facesWithPips < 6 || red < 1000 || white < 20 || outside != 0 || ms > 800.0) return 1;
   return 0;
 }

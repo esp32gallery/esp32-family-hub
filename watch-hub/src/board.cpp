@@ -224,6 +224,15 @@ void vibrate(uint16_t ms, uint8_t strength) {
 void push(uint16_t *fb) {
   if (!fb) return;
   maskRound(fb);
+  // The CO5300 framebuffer is rgb565_2Byte: QSPI sends the low byte first,
+  // and that byte is RRRRRGGG. pushImage(uint16_t*) with swapBytes left at
+  // its default false treats the buffer as already swapped and copies it
+  // straight through, so native RGB565 (red = 0xF800) is read as 0x00F8
+  // and a red die comes out green-cyan. swapBytes true converts on the way
+  // in. This is byte order, not an R/B channel swap — the panel MADCTL has
+  // no BGR bit and stays 0x00.
+  const bool prevSwap = M5.Display.getSwapBytes();
+  M5.Display.setSwapBytes(true);
   constexpr int kBand = 32;
   M5.Display.startWrite();
   for (int y = 0; y < kHeight; y += kBand) {
@@ -231,6 +240,7 @@ void push(uint16_t *fb) {
     M5.Display.pushImage(0, y, kWidth, h, fb + (size_t)y * kWidth);
   }
   M5.Display.endWrite();
+  M5.Display.setSwapBytes(prevSwap);
 }
 
 }  // namespace board

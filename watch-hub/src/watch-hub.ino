@@ -291,16 +291,23 @@ static void drawHome() {
   ui.flush();
 }
 
+// p.focal is in 480-canvas units. 1600 puts a tilted cube's corners ~327px
+// from center at rest and ~400px at the toss peak; the round glass only
+// keeps radius 231 (mask is W/2-2). 660 is sized from that projected
+// bounding radius — not the face width — so the worst corner during the
+// roll, including the 78px toss, stays ~17px inside the mask.
+static constexpr float kDiceFocal = 660.0f;
+
 static void renderDie(dice::Quat q, float yOff) {
   diceRenderer.buf = diceBig;
   diceRenderer.W = diceRenderer.H = SCR_W;
-  diceRenderer.p.focal = 1600.0f;
+  diceRenderer.p.focal = kDiceFocal;
   diceRenderer.p.camZ = 4.2f;
   diceRenderer.renderFast(q, yOff);
 }
 
 static float liftToWorld(int liftPx) {
-  float focal = 1600.0f * (SCR_W / 480.0f);
+  float focal = kDiceFocal * (SCR_W / 480.0f);
   return liftPx * 4.2f / focal;
 }
 

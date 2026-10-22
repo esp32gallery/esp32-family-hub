@@ -390,8 +390,9 @@ public:
   // 投影约定与 render() 相同：物体空间顶点先旋转，相机平移只进 z
   // （wz = v.z + camZ），垂直偏移只加在屏幕 y（v.y + yOff）。不要把 camZ
   // 再加进旋转前的坐标，否则骰子会缩成大约 1/6。
-  // p.focal 以 480 画布为基准，内部按 W/480 缩放。466 上 focal=1600、
-  // camZ=4.2 时骰子直径约 0.8*W，单帧大约十几毫秒。
+  // p.focal 以 480 画布为基准，内部按 W/480 缩放。按面宽估成 0.8*W
+  // 会偏大：倾斜后角点的投影半径更大。466 上 focal=1600 时角点超出圆屏。
+  // 腕表固件把 focal 收到能罩住抛起峰值的外接半径。单帧大约十几毫秒。
   void renderFast(Quat q, float yOff) {
     if (!buf || W < 8 || H < 8) return;
     memset(buf, 0, (size_t)W * (size_t)H * sizeof(uint16_t));
